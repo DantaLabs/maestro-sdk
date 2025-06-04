@@ -6,6 +6,7 @@ import copy
 from typing import Optional, Dict, Any, List, Union, Tuple, Iterator
 from uuid import UUID, uuid4
 from pydantic import EmailStr 
+from pathlib import Path
 
 from .models import ( 
     MaestroBaseModel, Token, 
@@ -113,7 +114,7 @@ class MaestroClient:
         query_params: Optional[Dict[str, Any]] = None,
         json_data: Optional[Any] = None,
         form_data: Optional[Dict[str, str]] = None,
-        files: Optional[Dict[str, Tuple[str, io.BytesIO, str]]] = None,
+        files: Optional[Dict[str, Tuple[str, Any, str]]] = None,
         expected_status: int = 200,
         response_model: Optional[type[MaestroBaseModel]] = None,
         return_type: str = "json",
@@ -178,19 +179,16 @@ class MaestroClient:
             content_to_send = form_data
         elif files:
             files_to_send = files
-            data_fields = final_query_params or {}
-            if form_data:
-                 data_fields.update(form_data)
-            content_to_send = _clean_params(data_fields)
-            final_query_params = None 
+            # For file uploads with embedded form fields, don't send separate data
+            content_to_send = None
 
         try:
             response = http_client.request(
                 method,
                 url_path,
-                params=final_query_params if not (files or (form_data and method != "GET")) else None,
+                params=final_query_params if files or (not form_data) else None,
                 json=content_to_send if current_json_data is not None and not (form_data or files) else None,
-                data=content_to_send if (form_data or files) else None,
+                data=content_to_send if form_data and not files else None,  # Don't send data when we have files
                 files=files_to_send,
                 headers=headers,
             )
@@ -530,6 +528,383 @@ class MaestroClient:
             expected_status=200,
             response_model=AgentDefinition
         )
+
+    # Bundle-related methods
+    
+    def create_bundle(
+        self, 
+        source_dir: str, 
+        output_path: Optional[str] = None,
+        include_requirements: bool = True,
+        maestro_config: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Creates a ZIP bundle from a source directory for agent deployment.
+        
+        Args:
+            source_dir: Path to the directory containing agent code
+            output_path: Path for the output ZIP file. If None, creates in temp directory
+            include_requirements: Whether to automatically include requirements from pyproject.toml or requirements.txt
+            maestro_config: Optional maestro.yaml configuration to include in the bundle
+            
+        Returns:
+            str: Path to the created bundle ZIP file
+            
+        Raises:
+            MaestroError: If bundle creation fails
+        """
+        import zipfile
+        import tempfile
+        import os
+        import yaml
+        from pathlib import Path
+        
+        source_path = Path(source_dir)
+        if not source_path.exists() or not source_path.is_dir():
+            raise MaestroError(f"Source directory '{source_dir}' does not exist or is not a directory")
+        
+        # Create output path if not provided
+        if output_path is None:
+            temp_dir = tempfile.mkdtemp(prefix="maestro_bundle_")
+            output_path = os.path.join(temp_dir, "agent_bundle.zip")
+        
+        try:
+            with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # Keep track of files we've added to avoid duplicates
+                added_files = set()
+                
+                # Add all files from source directory
+                for root, dirs, files in os.walk(source_path):
+                    # Skip common directories that shouldn't be in bundles
+                    dirs[:] = [d for d in dirs if d not in {'.git', '__pycache__', '.pytest_cache', 'node_modules', '.venv', 'venv'}]
+                    
+                    for file in files:
+                        # Skip common files that shouldn't be in bundles
+                        if file.startswith('.') and file not in {'.env.example'}:
+                            continue
+                        if file.endswith(('.pyc', '.pyo', '.pyd')):
+                            continue
+                            
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path, source_path)
+                        zipf.write(file_path, arcname)
+                        added_files.add(arcname)
+                
+                # Handle requirements inclusion (only if not already present)
+                if include_requirements and "requirements.txt" not in added_files:
+                    requirements_content = self._extract_requirements(source_path)
+                    if requirements_content:
+                        zipf.writestr("requirements.txt", requirements_content)
+                        added_files.add("requirements.txt")
+                
+                # Create maestro.yaml config if provided (only if not already present)
+                has_maestro_config = any(name in added_files for name in ["maestro.yaml", "maestro.yml"])
+                
+                if maestro_config and not has_maestro_config:
+                    yaml_content = yaml.dump(maestro_config, default_flow_style=False)
+                    zipf.writestr("maestro.yaml", yaml_content)
+                    added_files.add("maestro.yaml")
+                elif not has_maestro_config:
+                    # Create a basic maestro.yaml if none exists
+                    default_config = {
+                        "entrypoint": "main.py",
+                        "description": "Agent bundle",
+                        "version": "1.0.0"
+                    }
+                    yaml_content = yaml.dump(default_config, default_flow_style=False)
+                    zipf.writestr("maestro.yaml", yaml_content)
+                    added_files.add("maestro.yaml")
+                    
+            return output_path
+            
+        except Exception as e:
+            if output_path and os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except:
+                    pass
+            raise MaestroError(f"Failed to create bundle: {e}") from e
+    
+    def _extract_requirements(self, source_path: Path) -> Optional[str]:
+        """
+        Extracts requirements from pyproject.toml or requirements.txt files.
+        
+        Args:
+            source_path: Path to the source directory
+            
+        Returns:
+            Optional[str]: Requirements content or None if no requirements found
+        """
+        # Check for pyproject.toml first
+        pyproject_path = source_path / "pyproject.toml"
+        if pyproject_path.exists():
+            pyproject_data = None
+            
+            # Try different TOML parsers
+            try:
+                import tomli
+                with open(pyproject_path, 'rb') as f:
+                    pyproject_data = tomli.load(f)
+            except ImportError:
+                try:
+                    import tomllib
+                    with open(pyproject_path, 'rb') as f:
+                        pyproject_data = tomllib.load(f)
+                except ImportError:
+                    try:
+                        import toml
+                        with open(pyproject_path, 'r') as f:
+                            pyproject_data = toml.load(f)
+                    except ImportError:
+                        pass  # No TOML parser available
+            except Exception:
+                pass  # Failed to parse pyproject.toml
+                
+            if pyproject_data:
+                dependencies = []
+                
+                # Extract from project.dependencies
+                if 'project' in pyproject_data and 'dependencies' in pyproject_data['project']:
+                    dependencies.extend(pyproject_data['project']['dependencies'])
+                
+                # Extract from tool.poetry.dependencies (if using Poetry)
+                if 'tool' in pyproject_data and 'poetry' in pyproject_data['tool']:
+                    poetry_deps = pyproject_data['tool']['poetry'].get('dependencies', {})
+                    for dep, version in poetry_deps.items():
+                        if dep != 'python':  # Skip python version
+                            if isinstance(version, str):
+                                dependencies.append(f"{dep}{version}")
+                            elif isinstance(version, dict) and 'version' in version:
+                                dependencies.append(f"{dep}{version['version']}")
+                            else:
+                                dependencies.append(dep)
+                
+                if dependencies:
+                    return '\n'.join(dependencies)
+        
+        # Check for requirements.txt
+        requirements_path = source_path / "requirements.txt"
+        if requirements_path.exists():
+            try:
+                return requirements_path.read_text().strip()
+            except Exception:
+                pass
+        
+        return None
+    
+    def upload_agent_bundle(
+        self,
+        bundle_path: str,
+        name: str,
+        description: Optional[str] = None,
+        input_schema: Optional[Dict[str, Any]] = None,
+        output_schema: Optional[Dict[str, Any]] = None,
+        interface_id: Optional[UUID] = None
+    ) -> AgentDefinition:
+        """
+        Uploads a ZIP bundle to create a new Agent Definition.
+        
+        Args:
+            bundle_path: Path to the ZIP bundle file
+            name: Name for the Agent Definition
+            description: Optional description
+            input_schema: Optional input schema
+            output_schema: Optional output schema
+            interface_id: Optional interface ID
+            
+        Returns:
+            AgentDefinition: The created agent definition
+            
+        Raises:
+            MaestroError: If bundle upload fails
+        """
+        from pathlib import Path
+        import json
+        
+        bundle_file = Path(bundle_path)
+        if not bundle_file.exists() or not bundle_file.is_file():
+            raise MaestroError(f"Bundle file '{bundle_path}' does not exist or is not a file")
+        
+        if not bundle_file.name.lower().endswith('.zip'):
+            raise MaestroError("Bundle file must be a ZIP file")
+        
+        try:
+            # Prepare form data for text fields
+            form_data = {
+                "name": name,
+            }
+            
+            if description:
+                form_data["description"] = description
+            if input_schema:
+                form_data["input_schema"] = json.dumps(input_schema)
+            if output_schema:
+                form_data["output_schema"] = json.dumps(output_schema)
+            if interface_id:
+                form_data["interface_id"] = str(interface_id)
+            
+            # Prepare file data for the bundle - keep file open during request
+            with open(bundle_file, 'rb') as bundle_file_handle:
+                # Include both files and form fields in the files parameter for proper multipart form
+                files_data = {
+                    "bundle": (bundle_file.name, bundle_file_handle, "application/zip"),
+                }
+                
+                # Add form fields to files_data (httpx format for form fields in multipart)
+                for key, value in form_data.items():
+                    files_data[key] = (None, value)
+                
+                return self._request(
+                    method="POST",
+                    path="/api/v1/agents/agent-definitions/bundle/",
+                    files=files_data,  # Only use files parameter, no separate form_data
+                    expected_status=200,
+                    response_model=AgentDefinition
+                )
+            
+        except Exception as e:
+            if isinstance(e, (MaestroError, MaestroApiError)):
+                raise
+            raise MaestroError(f"Failed to upload bundle: {e}") from e
+    
+    def update_agent_bundle(
+        self,
+        definition_id: UUID,
+        bundle_path: str,
+        organization_id: Optional[UUID] = None
+    ) -> AgentDefinition:
+        """
+        Updates an existing bundled Agent Definition with a new ZIP bundle.
+        
+        Args:
+            definition_id: UUID of the agent definition to update
+            bundle_path: Path to the new ZIP bundle file
+            organization_id: Optional organization ID (uses client's organization if not provided)
+            
+        Returns:
+            AgentDefinition: The updated agent definition
+            
+        Raises:
+            MaestroError: If bundle update fails
+        """
+        from pathlib import Path
+        
+        bundle_file = Path(bundle_path)
+        if not bundle_file.exists() or not bundle_file.is_file():
+            raise MaestroError(f"Bundle file '{bundle_path}' does not exist or is not a file")
+        
+        if not bundle_file.name.lower().endswith('.zip'):
+            raise MaestroError("Bundle file must be a ZIP file")
+        
+        try:
+            # Prepare form data
+            form_data = {}
+            if organization_id:
+                form_data["organization_id"] = str(organization_id)
+            
+            # Prepare file data - keep file open during request
+            with open(bundle_file, 'rb') as bundle_file_handle:
+                # Include both files and form fields in the files parameter for proper multipart form
+                files_data = {
+                    "bundle": (bundle_file.name, bundle_file_handle, "application/zip"),
+                }
+                
+                # Add form fields to files_data (httpx format for form fields in multipart)
+                for key, value in form_data.items():
+                    files_data[key] = (None, value)
+                
+                return self._request(
+                    method="PUT",
+                    path="/api/v1/agents/agent-definitions/{definition_id}/bundle",
+                    path_params={"definition_id": definition_id},
+                    files=files_data,  # Only use files parameter, no separate form_data
+                    expected_status=200,
+                    response_model=AgentDefinition
+                )
+            
+        except Exception as e:
+            if isinstance(e, (MaestroError, MaestroApiError)):
+                raise
+            raise MaestroError(f"Failed to update bundle: {e}") from e
+    
+    def download_agent_definition_bundle(self, definition_id: UUID) -> bytes:
+        """
+        Downloads the bundle for a specific agent definition.
+        
+        Args:
+            definition_id: UUID of the agent definition
+            
+        Returns:
+            bytes: The bundle content as bytes
+            
+        Raises:
+            MaestroApiError: If the agent definition does not use a bundle or the bundle is not found
+        """
+        return self._request(
+            method="GET",
+            path="/api/v1/agents/agent-definitions/{definition_id}/bundle",
+            path_params={"definition_id": definition_id},
+            expected_status=200,
+            return_type="bytes"
+        )
+    
+    def create_and_upload_bundle(
+        self,
+        source_dir: str,
+        name: str,
+        description: Optional[str] = None,
+        input_schema: Optional[Dict[str, Any]] = None,
+        output_schema: Optional[Dict[str, Any]] = None,
+        interface_id: Optional[UUID] = None,
+        include_requirements: bool = True,
+        maestro_config: Optional[Dict[str, Any]] = None,
+        cleanup_bundle: bool = True
+    ) -> AgentDefinition:
+        """
+        Creates a bundle from a source directory and uploads it to create an Agent Definition.
+        
+        This is a convenience method that combines create_bundle() and upload_agent_bundle().
+        
+        Args:
+            source_dir: Path to the directory containing agent code
+            name: Name for the Agent Definition
+            description: Optional description
+            input_schema: Optional input schema
+            output_schema: Optional output schema
+            interface_id: Optional interface ID
+            include_requirements: Whether to automatically include requirements
+            maestro_config: Optional maestro.yaml configuration
+            cleanup_bundle: Whether to delete the temporary bundle file after upload
+            
+        Returns:
+            AgentDefinition: The created agent definition
+        """
+        bundle_path = None
+        try:
+            # Create the bundle
+            bundle_path = self.create_bundle(
+                source_dir=source_dir,
+                include_requirements=include_requirements,
+                maestro_config=maestro_config
+            )
+            
+            # Upload the bundle
+            return self.upload_agent_bundle(
+                bundle_path=bundle_path,
+                name=name,
+                description=description,
+                input_schema=input_schema,
+                output_schema=output_schema,
+                interface_id=interface_id
+            )
+            
+        finally:
+            # Clean up the temporary bundle file if requested
+            if cleanup_bundle and bundle_path and os.path.exists(bundle_path):
+                try:
+                    os.remove(bundle_path)
+                except Exception:
+                    pass  # Ignore cleanup errors
 
     # Agent instance methods
     
@@ -1110,7 +1485,104 @@ class MaestroClient:
             expected_status=201,
             response_model=Message, add_org_id_query=False
         )
+    def get_bundle_download_url(self, agent_id: Optional[UUID] = None) -> str:
+        """
+        Get a temporary download URL for the agent's bundle.
+        
+        Args:
+            agent_id: Optional agent ID. If not specified, uses the client's initialized agent_id.
+            
+        Returns:
+            A temporary download URL for the agent's bundle.
+            
+        Raises:
+            MaestroApiError: If the agent does not use a bundle or the bundle is not found.
+        """
+        agent_id_to_use = agent_id or self._ensure_agent_id_set()
+        
+        result = self._request(
+            method="GET", path="/api/v1/agents/{agent_id}/bundle",
+            path_params={"agent_id": agent_id_to_use},
+            expected_status=200, return_type="json"
+        )
+        
+        if not result or "download_url" not in result:
+            raise MaestroError("Failed to get bundle download URL")
+        
+        return result["download_url"]
     
+    def download_bundle(self, target_dir: Optional[str] = None, agent_id: Optional[UUID] = None) -> str:
+        """
+        Download the agent's bundle to a local directory.
+        
+        Args:
+            target_dir: Directory to download the bundle to. If not specified, uses a temporary directory.
+            agent_id: Optional agent ID. If not specified, uses the client's initialized agent_id.
+            
+        Returns:
+            Path to the downloaded bundle ZIP file.
+            
+        Raises:
+            MaestroApiError: If the agent does not use a bundle or the bundle is not found.
+        """
+        import tempfile
+        import os
+        
+        agent_id_to_use = agent_id or self._ensure_agent_id_set()
+        
+        # Create target directory if it doesn't exist
+        if not target_dir:
+            target_dir = tempfile.mkdtemp(prefix="maestro_bundle_")
+        elif not os.path.exists(target_dir):
+            os.makedirs(target_dir)
+            
+        # Download the file directly from the API endpoint
+        bundle_path = os.path.join(target_dir, "agent_bundle.zip")
+        
+        response = self._request(
+            method="GET",
+            path="/api/v1/agents/bundle/{agent_id}/",
+            path_params={"agent_id": agent_id_to_use},
+            expected_status=200,
+            return_type="bytes"
+        )
+        
+        if not response:
+            raise MaestroError("Failed to download bundle")
+        
+        # Save the bundle
+        with open(bundle_path, 'wb') as f:
+            f.write(response)
+            
+        return bundle_path
+        
+    def extract_bundle(self, bundle_path: str, target_dir: Optional[str] = None) -> str:
+        """
+        Extract a downloaded bundle to a directory.
+        
+        Args:
+            bundle_path: Path to the downloaded bundle ZIP file.
+            target_dir: Directory to extract the bundle to. If not specified, extracts to the same directory.
+            
+        Returns:
+            Path to the directory containing the extracted bundle.
+        """
+        import zipfile
+        import os
+        
+        # Default extract location is same directory as the ZIP
+        if not target_dir:
+            target_dir = os.path.dirname(bundle_path)
+            
+        # Create extract directory if it doesn't exist
+        if not os.path.exists(target_dir):
+            os.makedirs(target_dir)
+            
+        # Extract the bundle
+        with zipfile.ZipFile(bundle_path, 'r') as zip_ref:
+            zip_ref.extractall(target_dir)
+            
+        return target_dir
     # Lifecycle methods
     
     def close(self):

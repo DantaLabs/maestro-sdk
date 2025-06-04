@@ -924,6 +924,457 @@ def run_agent(
         typer.secho(f"Unexpected error during agent execution: {e}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
+@app.command()
+def create_bundle(
+    source_dir: Annotated[Path, typer.Argument(
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Path to the directory containing the agent code.",
+    )],
+    output_path: Annotated[Optional[Path], typer.Option(
+        "--output", "-o",
+        help="Output path for the bundle ZIP file. If not provided, creates in temp directory."
+    )] = None,
+    name: Annotated[Optional[str], typer.Option(
+        "--name", "-n",
+        help="Name for the agent (used for maestro.yaml if not present)."
+    )] = None,
+    description: Annotated[Optional[str], typer.Option(
+        "--desc", "-d",
+        help="Description for the agent (used for maestro.yaml if not present)."
+    )] = None,
+    entrypoint: Annotated[Optional[str], typer.Option(
+        "--entrypoint", "-e",
+        help="Entrypoint file for the agent (default: main.py)."
+    )] = "main.py",
+    version: Annotated[Optional[str], typer.Option(
+        "--version", "-v",
+        help="Version for the agent (default: 1.0.0)."
+    )] = "1.0.0",
+    no_requirements: Annotated[bool, typer.Option(
+        "--no-requirements",
+        help="Skip automatic inclusion of requirements from pyproject.toml or requirements.txt."
+    )] = False,
+    # Add shared options
+    org_id: Annotated[Optional[UUID], typer.Option("--org-id", help="Maestro Organization ID (Overrides env var).")] = None,
+    url: Annotated[Optional[str], typer.Option("--url", help="Maestro API Base URL (Overrides env var).")] = None,
+    token: Annotated[Optional[str], typer.Option("--token", help="Maestro Auth Token (Overrides env var).")] = None,
+):
+    """
+    Create a ZIP bundle from a source directory for agent deployment.
+    
+    The bundle will include all files from the source directory and automatically
+    include requirements from pyproject.toml or requirements.txt files if found.
+    """
+    client = get_client(org_id, url, token)
+    
+    # Determine bundle name
+    bundle_name = name or source_dir.name
+    
+    # Create maestro config
+    maestro_config = {
+        "entrypoint": entrypoint,
+        "description": description or f"Bundle for {bundle_name}",
+        "version": version
+    }
+    
+    try:
+        typer.echo(f"Creating bundle from '{source_dir}'...")
+        
+        bundle_path = client.create_bundle(
+            source_dir=str(source_dir),
+            output_path=str(output_path) if output_path else None,
+            include_requirements=not no_requirements,
+            maestro_config=maestro_config
+        )
+        
+        typer.secho(f"Bundle created successfully: {bundle_path}", fg=typer.colors.GREEN)
+        
+        # Show bundle info
+        import zipfile
+        with zipfile.ZipFile(bundle_path, 'r') as zipf:
+            file_count = len(zipf.namelist())
+            typer.echo(f"Bundle contains {file_count} files:")
+            for filename in sorted(zipf.namelist())[:10]:  # Show first 10 files
+                typer.echo(f"  - {filename}")
+            if file_count > 10:
+                typer.echo(f"  ... and {file_count - 10} more files")
+        
+    except Exception as e:
+        typer.secho(f"Error creating bundle: {e}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+@app.command()
+def upload_bundle(
+    bundle_path: Annotated[Path, typer.Argument(
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="Path to the ZIP bundle file to upload.",
+    )],
+    name: Annotated[str, typer.Option(
+        "--name", "-n",
+        help="Name for the Agent Definition."
+    )],
+    description: Annotated[Optional[str], typer.Option(
+        "--desc", "-d",
+        help="Optional description for the Agent Definition."
+    )] = None,
+    schema_file: Annotated[Optional[Path], typer.Option(
+        "--schema-file",
+        help="Path to a JSON file containing input/output schemas."
+    )] = None,
+    create_agent_flag: Annotated[bool, typer.Option(
+        "--create-agent/--no-create-agent",
+        help="Create an Agent instance linked to the definition."
+    )] = False,
+    agent_type: Annotated[str, typer.Option(
+        "--agent-type", "-t",
+        help="Type of the agent (required if creating an agent)."
+    )] = "script",
+    env_file: Annotated[Optional[Path], typer.Option(
+        "--env-file",
+        help="Path to a .env file containing environment variables as secrets."
+    )] = None,
+    # Add shared options
+    org_id: Annotated[Optional[UUID], typer.Option("--org-id", help="Maestro Organization ID (Overrides env var).")] = None,
+    url: Annotated[Optional[str], typer.Option("--url", help="Maestro API Base URL (Overrides env var).")] = None,
+    token: Annotated[Optional[str], typer.Option("--token", help="Maestro Auth Token (Overrides env var).")] = None,
+):
+    """
+    Upload a ZIP bundle to create a new Agent Definition.
+    
+    The bundle should contain agent code and optionally a maestro.yaml configuration file.
+    """
+    client = get_client(org_id, url, token)
+    
+    # Load schemas if provided
+    input_schema = {}
+    output_schema = {}
+    
+    if schema_file and schema_file.exists():
+        try:
+            typer.echo(f"Loading schemas from '{schema_file}'...")
+            with open(schema_file, 'r') as f:
+                schema_data = json.load(f)
+            
+            input_schema = schema_data.get('input', {})
+            output_schema = schema_data.get('output', {})
+            
+            if input_schema:
+                typer.echo("Input schema loaded.")
+            if output_schema:
+                typer.echo("Output schema loaded.")
+                
+        except json.JSONDecodeError as e:
+            typer.secho(f"Error parsing JSON file '{schema_file}': {e}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+        except Exception as e:
+            typer.secho(f"Error reading schema file '{schema_file}': {e}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+    
+    try:
+        typer.echo(f"Uploading bundle '{bundle_path.name}' as Agent Definition '{name}'...")
+        
+        agent_definition = client.upload_agent_bundle(
+            bundle_path=str(bundle_path),
+            name=name,
+            description=description,
+            input_schema=input_schema if input_schema else None,
+            output_schema=output_schema if output_schema else None
+        )
+        
+        typer.secho(f"Agent Definition '{agent_definition.name}' created successfully (ID: {agent_definition.id})", fg=typer.colors.GREEN)
+        
+        # Create agent if requested
+        if create_agent_flag:
+            # Load secrets from .env file if provided
+            secrets = {}
+            
+            if not env_file:
+                default_env_file = Path('.env')
+                if default_env_file.exists():
+                    env_file = default_env_file
+                    typer.echo(f"Found default .env file in current directory.")
+            
+            if env_file and env_file.exists():
+                try:
+                    typer.echo(f"Loading secrets from '{env_file}'...")
+                    secrets = dotenv.dotenv_values(env_file)
+                    if secrets:
+                        typer.echo(f"Loaded {len(secrets)} secrets.")
+                except Exception as e:
+                    typer.secho(f"Error reading .env file '{env_file}': {e}", fg=typer.colors.YELLOW, err=True)
+            
+            try:
+                typer.echo(f"Creating agent '{name}' with definition ID {agent_definition.id}...")
+                
+                agent_payload = AgentCreate(
+                    name=name,
+                    description=description,
+                    agent_type=agent_type,
+                    agent_definition_id=agent_definition.id,
+                    secrets=secrets if secrets else None
+                )
+                
+                created_agent = client.create_agent(agent_payload)
+                typer.secho(f"Agent '{created_agent.name}' created successfully (ID: {created_agent.id})", fg=typer.colors.GREEN)
+                
+            except Exception as e:
+                typer.secho(f"Error creating agent: {e}", fg=typer.colors.YELLOW, err=True)
+                typer.echo("Agent Definition was created successfully, but agent creation failed.")
+        
+    except Exception as e:
+        typer.secho(f"Error uploading bundle: {e}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+@app.command()
+def deploy_bundle(
+    source_dir: Annotated[Path, typer.Argument(
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Path to the directory containing the agent code.",
+    )],
+    name: Annotated[Optional[str], typer.Option(
+        "--name", "-n",
+        help="Name for the Agent Definition and Agent. Defaults to the directory name."
+    )] = None,
+    description: Annotated[Optional[str], typer.Option(
+        "--desc", "-d",
+        help="Optional description for the Agent Definition."
+    )] = None,
+    entrypoint: Annotated[Optional[str], typer.Option(
+        "--entrypoint", "-e",
+        help="Entrypoint file for the agent (default: main.py)."
+    )] = "main.py",
+    version: Annotated[Optional[str], typer.Option(
+        "--version", "-v",
+        help="Version for the agent (default: 1.0.0)."
+    )] = "1.0.0",
+    schema_file: Annotated[Optional[Path], typer.Option(
+        "--schema-file",
+        help="Path to a JSON file containing input/output schemas."
+    )] = None,
+    create_agent_flag: Annotated[bool, typer.Option(
+        "--create-agent/--no-create-agent",
+        help="Create an Agent instance linked to the definition."
+    )] = True,
+    agent_type: Annotated[str, typer.Option(
+        "--agent-type", "-t",
+        help="Type of the agent."
+    )] = "script",
+    env_file: Annotated[Optional[Path], typer.Option(
+        "--env-file",
+        help="Path to a .env file containing environment variables as secrets."
+    )] = None,
+    no_requirements: Annotated[bool, typer.Option(
+        "--no-requirements",
+        help="Skip automatic inclusion of requirements from pyproject.toml or requirements.txt."
+    )] = False,
+    # Add shared options
+    org_id: Annotated[Optional[UUID], typer.Option("--org-id", help="Maestro Organization ID (Overrides env var).")] = None,
+    url: Annotated[Optional[str], typer.Option("--url", help="Maestro API Base URL (Overrides env var).")] = None,
+    token: Annotated[Optional[str], typer.Option("--token", help="Maestro Auth Token (Overrides env var).")] = None,
+):
+    """
+    Create and deploy a bundle from a source directory in one command.
+    
+    This combines bundle creation and upload into a single operation.
+    Automatically loads schemas and secrets from the source directory.
+    """
+    client = get_client(org_id, url, token)
+    
+    # Determine agent name
+    agent_name = name or source_dir.name
+    
+    # Load schemas if provided or look for default
+    input_schema = {}
+    output_schema = {}
+    
+    if not schema_file:
+        default_schema_file = source_dir / f"{agent_name}.json"
+        if default_schema_file.exists():
+            schema_file = default_schema_file
+    
+    if schema_file and schema_file.exists():
+        try:
+            typer.echo(f"Loading schemas from '{schema_file}'...")
+            with open(schema_file, 'r') as f:
+                schema_data = json.load(f)
+            
+            input_schema = schema_data.get('input', {})
+            output_schema = schema_data.get('output', {})
+            
+            if input_schema:
+                typer.echo("Input schema loaded.")
+            if output_schema:
+                typer.echo("Output schema loaded.")
+                
+        except Exception as e:
+            typer.secho(f"Error loading schemas: {e}", fg=typer.colors.YELLOW, err=True)
+            typer.echo("Continuing without schemas.")
+    
+    # Load secrets from .env file
+    secrets = {}
+    
+    if not env_file:
+        default_env_file = source_dir / '.env'
+        if default_env_file.exists():
+            env_file = default_env_file
+    
+    if env_file and env_file.exists():
+        try:
+            typer.echo(f"Loading secrets from '{env_file}'...")
+            secrets = dotenv.dotenv_values(env_file)
+            if secrets:
+                typer.echo(f"Loaded {len(secrets)} secrets.")
+        except Exception as e:
+            typer.secho(f"Error reading .env file '{env_file}': {e}", fg=typer.colors.YELLOW, err=True)
+    
+    # Create maestro config
+    maestro_config = {
+        "entrypoint": entrypoint,
+        "description": description or f"Bundle for {agent_name}",
+        "version": version
+    }
+    
+    try:
+        typer.echo(f"Creating and deploying bundle from '{source_dir}' as '{agent_name}'...")
+        
+        agent_definition = client.create_and_upload_bundle(
+            source_dir=str(source_dir),
+            name=agent_name,
+            description=description,
+            input_schema=input_schema if input_schema else None,
+            output_schema=output_schema if output_schema else None,
+            include_requirements=not no_requirements,
+            maestro_config=maestro_config
+        )
+        
+        typer.secho(f"Agent Definition '{agent_definition.name}' created successfully (ID: {agent_definition.id})", fg=typer.colors.GREEN)
+        
+        # Create agent if requested
+        if create_agent_flag:
+            try:
+                typer.echo(f"Creating agent '{agent_name}' with definition ID {agent_definition.id}...")
+                
+                agent_payload = AgentCreate(
+                    name=agent_name,
+                    description=description,
+                    agent_type=agent_type,
+                    agent_definition_id=agent_definition.id,
+                    secrets=secrets if secrets else None
+                )
+                
+                created_agent = client.create_agent(agent_payload)
+                typer.secho(f"Agent '{created_agent.name}' created successfully (ID: {created_agent.id})", fg=typer.colors.GREEN)
+                
+            except Exception as e:
+                typer.secho(f"Error creating agent: {e}", fg=typer.colors.YELLOW, err=True)
+                typer.echo("Agent Definition was created successfully, but agent creation failed.")
+        
+    except Exception as e:
+        typer.secho(f"Error deploying bundle: {e}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+@app.command()
+def update_bundle(
+    definition_id: Annotated[str, typer.Argument(help="Agent Definition ID to update")],
+    bundle_path: Annotated[Path, typer.Argument(
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="Path to the new ZIP bundle file.",
+    )],
+    # Add shared options
+    org_id: Annotated[Optional[UUID], typer.Option("--org-id", help="Maestro Organization ID (Overrides env var).")] = None,
+    url: Annotated[Optional[str], typer.Option("--url", help="Maestro API Base URL (Overrides env var).")] = None,
+    token: Annotated[Optional[str], typer.Option("--token", help="Maestro Auth Token (Overrides env var).")] = None,
+):
+    """
+    Update an existing bundled Agent Definition with a new ZIP bundle.
+    """
+    client = get_client(org_id, url, token)
+    
+    try:
+        # Validate definition_id is a UUID
+        definition_uuid = UUID(definition_id)
+    except ValueError:
+        typer.secho(f"Error: '{definition_id}' is not a valid UUID.", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    
+    try:
+        typer.echo(f"Updating Agent Definition {definition_uuid} with bundle '{bundle_path.name}'...")
+        
+        updated_definition = client.update_agent_bundle(
+            definition_id=definition_uuid,
+            bundle_path=str(bundle_path)
+        )
+        
+        typer.secho(f"Agent Definition '{updated_definition.name}' updated successfully", fg=typer.colors.GREEN)
+        
+    except Exception as e:
+        typer.secho(f"Error updating bundle: {e}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+@app.command()
+def download_definition_bundle(
+    definition_id: Annotated[str, typer.Argument(help="Agent Definition ID")],
+    output_path: Annotated[Optional[Path], typer.Option(
+        "--output", "-o",
+        help="Output path for the downloaded bundle. Defaults to 'agent_definition_bundle.zip'"
+    )] = None,
+    # Add shared options
+    org_id: Annotated[Optional[UUID], typer.Option("--org-id", help="Maestro Organization ID (Overrides env var).")] = None,
+    url: Annotated[Optional[str], typer.Option("--url", help="Maestro API Base URL (Overrides env var).")] = None,
+    token: Annotated[Optional[str], typer.Option("--token", help="Maestro Auth Token (Overrides env var).")] = None,
+):
+    """
+    Download the bundle for a specific Agent Definition.
+    """
+    client = get_client(org_id, url, token)
+    
+    try:
+        # Validate definition_id is a UUID
+        definition_uuid = UUID(definition_id)
+    except ValueError:
+        typer.secho(f"Error: '{definition_id}' is not a valid UUID.", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    
+    # Determine output path
+    if output_path is None:
+        output_path = Path("agent_definition_bundle.zip")
+    
+    try:
+        typer.echo(f"Downloading bundle for Agent Definition {definition_uuid}...")
+        
+        bundle_data = client.download_agent_definition_bundle(definition_uuid)
+        
+        with open(output_path, 'wb') as f:
+            f.write(bundle_data)
+        
+        typer.secho(f"Bundle downloaded successfully: {output_path}", fg=typer.colors.GREEN)
+        
+        # Show bundle info
+        import zipfile
+        with zipfile.ZipFile(output_path, 'r') as zipf:
+            file_count = len(zipf.namelist())
+            typer.echo(f"Downloaded bundle contains {file_count} files")
+        
+    except Exception as e:
+        typer.secho(f"Error downloading bundle: {e}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
 if __name__ == "__main__":
     app()
 
