@@ -52,7 +52,7 @@ class MaestroClient:
         agent_id: Optional[Union[UUID, str]] = None,
         base_url: Optional[str] = None,
         token: Optional[str] = None,
-        timeout: float = 30.0,
+        timeout: float = 120.0,
         raise_for_status: bool = True,
     ):
         try:
@@ -90,6 +90,10 @@ class MaestroClient:
             self._client = httpx.Client(base_url=self.base_url, timeout=self._timeout)
         return self._client
 
+    def _get_client_with_timeout(self, timeout: float) -> httpx.Client:
+        """Returns a httpx client with a custom timeout for specific operations."""
+        return httpx.Client(base_url=self.base_url, timeout=timeout)
+
     def _ensure_agent_id_set(self) -> UUID:
         """Checks if agent_id is set and returns it, otherwise raises ValueError."""
         if self.agent_id is None:
@@ -119,7 +123,8 @@ class MaestroClient:
         response_model: Optional[type[MaestroBaseModel]] = None,
         return_type: str = "json",
         *, 
-        add_org_id_query: bool = True 
+        add_org_id_query: bool = True,
+        custom_timeout: Optional[float] = None
     ) -> Any:
         """
         Internal helper for making requests to the Maestro API.
@@ -127,7 +132,13 @@ class MaestroClient:
         Automatically adds organization_id query param unless add_org_id_query=False.
         Handles authentication, serialization, and error handling for all API calls.
         """
-        http_client = self._get_client() 
+        # Use custom timeout client if specified, otherwise use default client
+        if custom_timeout:
+            http_client = self._get_client_with_timeout(custom_timeout)
+            use_custom_client = True
+        else:
+            http_client = self._get_client()
+            use_custom_client = False
 
         url_path = path
         if path_params:
@@ -265,6 +276,10 @@ class MaestroClient:
         except Exception as e:
              # Catch any other unexpected errors during request/response processing
              raise MaestroError(f"An unexpected error occurred during the request processing: {e}") from e
+        finally:
+            # Clean up custom client if used
+            if use_custom_client and http_client and not http_client.is_closed:
+                http_client.close()
 
 
  
@@ -536,6 +551,7 @@ class MaestroClient:
         source_dir: str, 
         output_path: Optional[str] = None,
         include_requirements: bool = True,
+        install_dependencies: bool = True,
         maestro_config: Optional[Dict[str, Any]] = None
     ) -> str:
         """
@@ -545,6 +561,7 @@ class MaestroClient:
             source_dir: Path to the directory containing agent code
             output_path: Path for the output ZIP file. If None, creates in temp directory
             include_requirements: Whether to automatically include requirements from pyproject.toml or requirements.txt
+            install_dependencies: Whether to install dependencies into the bundle (includes them as Python libraries)
             maestro_config: Optional maestro.yaml configuration to include in the bundle
             
         Returns:
@@ -557,7 +574,10 @@ class MaestroClient:
         import tempfile
         import os
         import yaml
+        import subprocess
+        import sys
         from pathlib import Path
+        from subprocess import TimeoutExpired
         
         source_path = Path(source_dir)
         if not source_path.exists() or not source_path.is_dir():
@@ -567,6 +587,11 @@ class MaestroClient:
         if output_path is None:
             temp_dir = tempfile.mkdtemp(prefix="maestro_bundle_")
             output_path = os.path.join(temp_dir, "agent_bundle.zip")
+        
+        # Create a temporary directory for dependency installation if needed
+        deps_temp_dir = None
+        if install_dependencies:
+            deps_temp_dir = tempfile.mkdtemp(prefix="maestro_deps_")
         
         try:
             with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
@@ -590,8 +615,88 @@ class MaestroClient:
                         zipf.write(file_path, arcname)
                         added_files.add(arcname)
                 
-                # Handle requirements inclusion (only if not already present)
-                if include_requirements and "requirements.txt" not in added_files:
+                # Handle dependencies installation and inclusion
+                if install_dependencies and deps_temp_dir:
+                    requirements_content = self._extract_requirements(source_path)
+                    if requirements_content:
+                        # Create a temporary requirements file
+                        req_file = os.path.join(deps_temp_dir, "temp_requirements.txt")
+                        with open(req_file, 'w') as f:
+                            f.write(requirements_content)
+                        
+                        try:
+                            # Install dependencies to the temporary directory
+                            print(f"Installing dependencies to bundle... (this may take several minutes)")
+                            print(f"Installing from: {req_file}")
+                            
+                            result = subprocess.run([
+                                sys.executable, "-m", "pip", "install", 
+                                "-r", req_file,
+                                "--target", deps_temp_dir,
+                                "--upgrade",  # Ensure we get the latest compatible versions
+                                "--no-cache-dir"  # Avoid cache issues
+                            ], check=True, capture_output=True, text=True, timeout=900)  # 15 minute timeout
+                            
+                            if result.stdout:
+                                print(f"Dependency installation completed.")
+                            if result.stderr and result.returncode == 0:
+                                print(f"Installation warnings: {result.stderr}")
+                            
+                            # Add installed packages to the bundle
+                            package_count = 0
+                            for root, dirs, files in os.walk(deps_temp_dir):
+                                # Skip pip metadata directories but keep the actual packages
+                                dirs[:] = [d for d in dirs if not d.endswith('.dist-info') and not d.endswith('.egg-info') and d != '__pycache__']
+                                
+                                for file in files:
+                                    if file == "temp_requirements.txt":
+                                        continue
+                                    if file.endswith(('.pyc', '.pyo', '.pyd')):
+                                        continue
+                                        
+                                    file_path = os.path.join(root, file)
+                                    # Create archive path relative to deps_temp_dir
+                                    arcname = os.path.relpath(file_path, deps_temp_dir)
+                                    
+                                    # Skip if file already exists in bundle (source takes precedence)
+                                    if arcname not in added_files:
+                                        zipf.write(file_path, arcname)
+                                        added_files.add(arcname)
+                                        package_count += 1
+                            
+                            print(f"Dependencies installed and included in bundle ({package_count} files added).")
+                            
+                        except subprocess.TimeoutExpired:
+                            print(f"Warning: Dependency installation timed out after 15 minutes.")
+                            print("Continuing with requirements.txt inclusion instead...")
+                            
+                            # Fall back to including requirements.txt if installation times out
+                            if include_requirements and "requirements.txt" not in added_files:
+                                zipf.writestr("requirements.txt", requirements_content)
+                                added_files.add("requirements.txt")
+                        except subprocess.CalledProcessError as e:
+                            print(f"Warning: Failed to install dependencies (exit code {e.returncode}): {e}")
+                            if e.stdout:
+                                print(f"stdout: {e.stdout}")
+                            if e.stderr:
+                                print(f"stderr: {e.stderr}")
+                            print("Continuing with requirements.txt inclusion instead...")
+                            
+                            # Fall back to including requirements.txt if installation fails
+                            if include_requirements and "requirements.txt" not in added_files:
+                                zipf.writestr("requirements.txt", requirements_content)
+                                added_files.add("requirements.txt")
+                        except Exception as e:
+                            print(f"Warning: Unexpected error during dependency installation: {e}")
+                            print("Continuing with requirements.txt inclusion instead...")
+                            
+                            # Fall back to including requirements.txt if installation fails
+                            if include_requirements and "requirements.txt" not in added_files:
+                                zipf.writestr("requirements.txt", requirements_content)
+                                added_files.add("requirements.txt")
+                
+                # Handle requirements inclusion (only if not installing dependencies or if no dependencies found)
+                elif include_requirements and "requirements.txt" not in added_files:
                     requirements_content = self._extract_requirements(source_path)
                     if requirements_content:
                         zipf.writestr("requirements.txt", requirements_content)
@@ -624,6 +729,14 @@ class MaestroClient:
                 except:
                     pass
             raise MaestroError(f"Failed to create bundle: {e}") from e
+        finally:
+            # Clean up temporary dependency directory
+            if deps_temp_dir and os.path.exists(deps_temp_dir):
+                try:
+                    import shutil
+                    shutil.rmtree(deps_temp_dir)
+                except Exception:
+                    pass  # Ignore cleanup errors
     
     def _extract_requirements(self, source_path: Path) -> Optional[str]:
         """
@@ -699,7 +812,13 @@ class MaestroClient:
         description: Optional[str] = None,
         input_schema: Optional[Dict[str, Any]] = None,
         output_schema: Optional[Dict[str, Any]] = None,
-        interface_id: Optional[UUID] = None
+        interface_id: Optional[UUID] = None,
+        entrypoint: str = "main.py",
+        version: str = "1.0.0",
+        requirements: Optional[List[str]] = None,
+        additional_metadata: Optional[Dict[str, Any]] = None,
+        shareable: bool = False,
+        upload_timeout: float = 600.0
     ) -> AgentDefinition:
         """
         Uploads a ZIP bundle to create a new Agent Definition.
@@ -711,6 +830,12 @@ class MaestroClient:
             input_schema: Optional input schema
             output_schema: Optional output schema
             interface_id: Optional interface ID
+            entrypoint: Main entry point file for the bundle (default: "main.py")
+            version: Version of the bundle (default: "1.0.0")
+            requirements: Optional list of requirements
+            additional_metadata: Optional additional metadata dictionary
+            shareable: Whether the agent definition is shareable (default: False)
+            upload_timeout: Timeout in seconds for the upload operation (default: 600.0)
             
         Returns:
             AgentDefinition: The created agent definition
@@ -732,6 +857,9 @@ class MaestroClient:
             # Prepare form data for text fields
             form_data = {
                 "name": name,
+                "entrypoint": entrypoint,
+                "version": version,
+                "shareable": str(shareable).lower(),
             }
             
             if description:
@@ -742,6 +870,10 @@ class MaestroClient:
                 form_data["output_schema"] = json.dumps(output_schema)
             if interface_id:
                 form_data["interface_id"] = str(interface_id)
+            if requirements:
+                form_data["requirements"] = json.dumps(requirements)
+            if additional_metadata:
+                form_data["additional_metadata"] = json.dumps(additional_metadata)
             
             # Prepare file data for the bundle - keep file open during request
             with open(bundle_file, 'rb') as bundle_file_handle:
@@ -759,7 +891,8 @@ class MaestroClient:
                     path="/api/v1/agents/agent-definitions/bundle/",
                     files=files_data,  # Only use files parameter, no separate form_data
                     expected_status=200,
-                    response_model=AgentDefinition
+                    response_model=AgentDefinition,
+                    custom_timeout=upload_timeout
                 )
             
         except Exception as e:
@@ -771,7 +904,11 @@ class MaestroClient:
         self,
         definition_id: UUID,
         bundle_path: str,
-        organization_id: Optional[UUID] = None
+        entrypoint: Optional[str] = None,
+        version: Optional[str] = None,
+        requirements: Optional[List[str]] = None,
+        additional_metadata: Optional[Dict[str, Any]] = None,
+        upload_timeout: float = 600.0
     ) -> AgentDefinition:
         """
         Updates an existing bundled Agent Definition with a new ZIP bundle.
@@ -779,7 +916,11 @@ class MaestroClient:
         Args:
             definition_id: UUID of the agent definition to update
             bundle_path: Path to the new ZIP bundle file
-            organization_id: Optional organization ID (uses client's organization if not provided)
+            entrypoint: Optional main entry point file for the bundle
+            version: Optional version of the bundle
+            requirements: Optional list of requirements
+            additional_metadata: Optional additional metadata dictionary
+            upload_timeout: Timeout in seconds for the upload operation (default: 600.0)
             
         Returns:
             AgentDefinition: The updated agent definition
@@ -788,6 +929,7 @@ class MaestroClient:
             MaestroError: If bundle update fails
         """
         from pathlib import Path
+        import json
         
         bundle_file = Path(bundle_path)
         if not bundle_file.exists() or not bundle_file.is_file():
@@ -797,10 +939,17 @@ class MaestroClient:
             raise MaestroError("Bundle file must be a ZIP file")
         
         try:
-            # Prepare form data
+            # Prepare form data for optional metadata fields
             form_data = {}
-            if organization_id:
-                form_data["organization_id"] = str(organization_id)
+            
+            if entrypoint:
+                form_data["entrypoint"] = entrypoint
+            if version:
+                form_data["version"] = version
+            if requirements:
+                form_data["requirements"] = json.dumps(requirements)
+            if additional_metadata:
+                form_data["additional_metadata"] = json.dumps(additional_metadata)
             
             # Prepare file data - keep file open during request
             with open(bundle_file, 'rb') as bundle_file_handle:
@@ -819,7 +968,8 @@ class MaestroClient:
                     path_params={"definition_id": definition_id},
                     files=files_data,  # Only use files parameter, no separate form_data
                     expected_status=200,
-                    response_model=AgentDefinition
+                    response_model=AgentDefinition,
+                    custom_timeout=upload_timeout
                 )
             
         except Exception as e:
@@ -856,9 +1006,16 @@ class MaestroClient:
         input_schema: Optional[Dict[str, Any]] = None,
         output_schema: Optional[Dict[str, Any]] = None,
         interface_id: Optional[UUID] = None,
+        entrypoint: str = "main.py",
+        version: str = "1.0.0",
+        requirements: Optional[List[str]] = None,
+        additional_metadata: Optional[Dict[str, Any]] = None,
+        shareable: bool = False,
         include_requirements: bool = True,
+        install_dependencies: bool = True,
         maestro_config: Optional[Dict[str, Any]] = None,
-        cleanup_bundle: bool = True
+        cleanup_bundle: bool = True,
+        upload_timeout: float = 600.0
     ) -> AgentDefinition:
         """
         Creates a bundle from a source directory and uploads it to create an Agent Definition.
@@ -872,19 +1029,38 @@ class MaestroClient:
             input_schema: Optional input schema
             output_schema: Optional output schema
             interface_id: Optional interface ID
+            entrypoint: Main entry point file for the bundle (default: "main.py")
+            version: Version of the bundle (default: "1.0.0")
+            requirements: Optional list of requirements (if not provided, extracted from source)
+            additional_metadata: Optional additional metadata dictionary
+            shareable: Whether the agent definition is shareable (default: False)
             include_requirements: Whether to automatically include requirements
+            install_dependencies: Whether to install dependencies into the bundle (includes them as Python libraries)
             maestro_config: Optional maestro.yaml configuration
             cleanup_bundle: Whether to delete the temporary bundle file after upload
+            upload_timeout: Timeout in seconds for the upload operation (default: 600.0)
             
         Returns:
             AgentDefinition: The created agent definition
         """
         bundle_path = None
         try:
+            # Extract requirements from source if not provided and include_requirements is True
+            final_requirements = requirements
+            if include_requirements and not final_requirements:
+                # Extract requirements from source directory
+                from pathlib import Path
+                source_path = Path(source_dir)
+                requirements_content = self._extract_requirements(source_path)
+                if requirements_content:
+                    # Convert requirements.txt content to list
+                    final_requirements = [req.strip() for req in requirements_content.split('\n') if req.strip()]
+            
             # Create the bundle
             bundle_path = self.create_bundle(
                 source_dir=source_dir,
                 include_requirements=include_requirements,
+                install_dependencies=install_dependencies,
                 maestro_config=maestro_config
             )
             
@@ -895,7 +1071,13 @@ class MaestroClient:
                 description=description,
                 input_schema=input_schema,
                 output_schema=output_schema,
-                interface_id=interface_id
+                interface_id=interface_id,
+                entrypoint=entrypoint,
+                version=version,
+                requirements=final_requirements,
+                additional_metadata=additional_metadata,
+                shareable=shareable,
+                upload_timeout=upload_timeout
             )
             
         finally:

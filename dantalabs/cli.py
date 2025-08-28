@@ -3,17 +3,21 @@ import os
 import sys
 import json 
 from pathlib import Path
-from typing import Optional, Annotated, Dict, Any
+from typing import Optional, Annotated, Dict, Any, Tuple
 from uuid import UUID
 import dotenv
 
 from .maestro import MaestroClient
 from .maestro.models import AgentDefinitionCreate, AgentCreate, AgentUpdate, Agent, AgentDefinition
 from .maestro.exceptions import MaestroApiError, MaestroAuthError, MaestroValidationError
+from datetime import datetime
+import os
 
 # --- Configuration File Handling ---
 CONFIG_DIR = Path.home() / ".maestro"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+PROJECT_STATE_FILE = ".maestro_state.json"
+VERSION = "0.0.1"
 
 def load_config() -> Dict[str, Any]:
     """Loads configuration from the JSON file."""
@@ -36,6 +40,367 @@ def save_config(config_data: Dict[str, Any]):
     except Exception as e:
         typer.secho(f"Error: Could not write configuration file at {CONFIG_FILE}: {e}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
+
+def load_project_state(project_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """Loads project-specific state from the local .maestro_state.json file."""
+    if project_dir is None:
+        project_dir = Path.cwd()
+    
+    state_file = project_dir / PROJECT_STATE_FILE
+    if state_file.exists():
+        try:
+            with open(state_file, "r") as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            typer.secho(f"Warning: Could not decode project state file at {state_file}. Ignoring.", fg=typer.colors.YELLOW, err=True)
+        except Exception as e:
+            typer.secho(f"Warning: Could not read project state file at {state_file}: {e}. Ignoring.", fg=typer.colors.YELLOW, err=True)
+    return {}
+
+def save_project_state(state_data: Dict[str, Any], project_dir: Optional[Path] = None):
+    """Saves project-specific state to the local .maestro_state.json file."""
+    if project_dir is None:
+        project_dir = Path.cwd()
+    
+    state_file = project_dir / PROJECT_STATE_FILE
+    try:
+        with open(state_file, "w") as f:
+            json.dump(state_data, f, indent=4)
+    except Exception as e:
+        typer.secho(f"Error: Could not write project state file at {state_file}: {e}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+def get_deploy_mode(client: "MaestroClient", agent_name: str, project_dir: Optional[Path] = None) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """Determines the deployment mode: 'create', 'update', or 'redeploy'.
+    
+    Returns:
+        Tuple of (mode, existing_data) where mode is 'create', 'update', or 'redeploy'
+        and existing_data contains info about existing definition/agent if found.
+    """
+    state = load_project_state(project_dir)
+    existing_data = {}
+    
+    # Check if we have stored agent/definition info from previous deployments
+    stored_definition_id = state.get("agent_definition_id")
+    stored_agent_id = state.get("agent_id")
+    stored_agent_name = state.get("agent_name")
+    
+    # If we have stored IDs and the name matches, try to fetch existing resources
+    if stored_definition_id and stored_agent_name == agent_name:
+        try:
+            # Check if definition still exists
+            definition = client.get_agent_definition(UUID(stored_definition_id))
+            existing_data["definition"] = definition
+            
+            # Check if agent still exists
+            if stored_agent_id:
+                try:
+                    agent = client.get_agent(UUID(stored_agent_id))
+                    existing_data["agent"] = agent
+                    return "update", existing_data
+                except MaestroApiError:
+                    # Agent was deleted but definition exists
+                    return "redeploy", existing_data
+            else:
+                # No agent stored, definition exists
+                return "redeploy", existing_data
+                
+        except MaestroApiError:
+            # Definition was deleted, start fresh
+            pass
+    
+    # Fallback: search by name in case state file is missing/outdated
+    try:
+        all_definitions = client.list_agent_definitions(name=agent_name)
+        if all_definitions:
+            definition = all_definitions[0]  # Take first match
+            existing_data["definition"] = definition
+            
+            # Check for agents using this definition
+            all_agents = client.list_agents(name=agent_name)
+            if all_agents:
+                agent = all_agents[0]  # Take first match
+                existing_data["agent"] = agent
+                return "update", existing_data
+            else:
+                return "redeploy", existing_data
+    except MaestroApiError:
+        pass
+    
+    return "create", existing_data
+
+def load_schemas(file_path: Path, schema_file: Optional[Path] = None) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Loads input, output, and memory schemas from JSON file."""
+    input_schema = {}
+    output_schema = {}
+    memory_template = {}
+    
+    # Try to load schemas from JSON file with same name if no specific file is provided
+    if not schema_file:
+        if file_path.is_file():
+            default_schema_file = file_path.with_suffix('.json')
+        else:
+            default_schema_file = file_path / f"{file_path.name}.json"
+        
+        if default_schema_file.exists():
+            schema_file = default_schema_file
+    
+    # Load schemas from the JSON file if it exists
+    if schema_file and schema_file.exists():
+        try:
+            typer.echo(f"Loading schemas from '{schema_file}'...")
+            with open(schema_file, 'r') as f:
+                schema_data = json.load(f)
+                
+            # Extract schemas from the file
+            if 'input' in schema_data:
+                input_schema = schema_data['input']
+                typer.echo("Input schema loaded.")
+            
+            if 'output' in schema_data:
+                output_schema = schema_data['output']
+                typer.echo("Output schema loaded.")
+            
+            if 'memory' in schema_data:
+                memory_template = schema_data['memory']
+                typer.echo("Memory template loaded.")
+        except json.JSONDecodeError as e:
+            typer.secho(f"Error parsing JSON file '{schema_file}': {e}", fg=typer.colors.RED, err=True)
+            typer.secho("Continuing with default empty schemas.", fg=typer.colors.YELLOW)
+        except Exception as e:
+            typer.secho(f"Error reading schema file '{schema_file}': {e}", fg=typer.colors.RED, err=True)
+            typer.secho("Continuing with default empty schemas.", fg=typer.colors.YELLOW)
+    
+    return input_schema, output_schema, memory_template
+
+def load_env_variables(base_dir: Path, env_file: Optional[Path] = None) -> Dict[str, Any]:
+    """Loads environment variables from .env file."""
+    env_variables = {}
+    
+    # Try to load environment variables from .env file
+    if not env_file:
+        default_env_file = base_dir / '.env'
+        if default_env_file.exists():
+            env_file = default_env_file
+    
+    if env_file and env_file.exists():
+        try:
+            typer.echo(f"Loading environment variables from '{env_file}'...")
+            env_variables = dotenv.dotenv_values(env_file)
+            if env_variables:
+                typer.echo(f"Loaded {len(env_variables)} environment variables.")
+            else:
+                typer.echo("No environment variables found in .env file.")
+        except Exception as e:
+            typer.secho(f"Error reading .env file '{env_file}': {e}", fg=typer.colors.RED, err=True)
+            typer.secho("Continuing without environment variables.", fg=typer.colors.YELLOW)
+    
+    return env_variables
+
+def deploy_single_file(
+    client: "MaestroClient",
+    agent_code: str,
+    agent_name: str,
+    description: Optional[str],
+    agent_type: str,
+    deploy_mode: str,
+    existing_data: Dict[str, Any],
+    create_agent: bool,
+    input_schema: Dict[str, Any],
+    output_schema: Dict[str, Any],
+    memory_template: Dict[str, Any],
+    env_variables: Dict[str, Any]
+) -> Tuple[Optional[UUID], Optional[UUID]]:
+    """Deploys a single Python file as an agent definition and optionally an agent."""
+    definition_id = None
+    agent_id = None
+    
+    # Handle definition
+    if deploy_mode == "create":
+        typer.echo("Creating new Agent Definition...")
+        definition_payload = AgentDefinitionCreate(
+            name=agent_name,
+            description=description,
+            definition=agent_code,
+            definition_type='python',
+            input_schema=input_schema,
+            output_schema=output_schema,
+            memory_template=memory_template,
+            environment_variables=env_variables,
+        )
+        created_def = client.create_agent_definition(definition_payload)
+        definition_id = created_def.id
+        typer.secho(f"Agent Definition '{created_def.name}' created (ID: {definition_id}).", fg=typer.colors.GREEN)
+    
+    elif deploy_mode == "update":
+        existing_definition = existing_data["definition"]
+        definition_id = existing_definition.id
+        typer.echo(f"Updating existing Agent Definition (ID: {definition_id})...")
+        definition_payload = AgentDefinitionCreate(
+            name=agent_name,
+            description=description or existing_definition.description,
+            definition=agent_code,
+            definition_type='python',
+            input_schema=input_schema or existing_definition.input_schema,
+            output_schema=output_schema or existing_definition.output_schema,
+            memory_template=memory_template or existing_definition.memory_template,
+            environment_variables=env_variables or existing_definition.environment_variables,
+        )
+        updated_def = client.update_agent_definition(definition_id, definition_payload)
+        typer.secho(f"Agent Definition '{updated_def.name}' updated (ID: {updated_def.id}).", fg=typer.colors.GREEN)
+    
+    elif deploy_mode == "redeploy":
+        existing_definition = existing_data["definition"]
+        definition_id = existing_definition.id
+        typer.echo(f"Redeploying with existing Agent Definition (ID: {definition_id})...")
+        # Update the definition with new code
+        definition_payload = AgentDefinitionCreate(
+            name=agent_name,
+            description=description or existing_definition.description,
+            definition=agent_code,
+            definition_type='python',
+            input_schema=input_schema or existing_definition.input_schema,
+            output_schema=output_schema or existing_definition.output_schema,
+            memory_template=memory_template or existing_definition.memory_template,
+            environment_variables=env_variables or existing_definition.environment_variables,
+        )
+        updated_def = client.update_agent_definition(definition_id, definition_payload)
+        typer.secho(f"Agent Definition '{updated_def.name}' redeployed (ID: {updated_def.id}).", fg=typer.colors.GREEN)
+    
+    # Handle agent creation/update
+    if create_agent and definition_id:
+        if deploy_mode == "update" and "agent" in existing_data:
+            existing_agent = existing_data["agent"]
+            agent_id = existing_agent.id
+            typer.echo(f"Updating existing Agent (ID: {agent_id})...")
+            agent_update_data = AgentUpdate(
+                name=agent_name,
+                description=description or existing_agent.description,
+                agent_definition_id=definition_id,
+                agent_type=agent_type,
+                capabilities=existing_agent.capabilities,
+                agent_metadata=existing_agent.agent_metadata
+            )
+            updated_agent = client.update_agent(agent_id, agent_update_data)
+            typer.secho(f"Agent '{updated_agent.name}' updated (ID: {updated_agent.id}).", fg=typer.colors.GREEN)
+        else:
+            typer.echo(f"Creating new Agent linked to definition {definition_id}...")
+            agent_payload = AgentCreate(
+                name=agent_name,
+                description=description,
+                agent_type=agent_type,
+                agent_definition_id=definition_id,
+            )
+            created_agent = client.create_agent(agent_payload)
+            agent_id = created_agent.id
+            typer.secho(f"Agent '{created_agent.name}' created (ID: {agent_id}).", fg=typer.colors.GREEN)
+    
+    return definition_id, agent_id
+
+def deploy_bundle_with_state(
+    client: "MaestroClient",
+    source_dir: Path,
+    agent_name: str,
+    description: Optional[str],
+    agent_type: str,
+    deploy_mode: str,
+    existing_data: Dict[str, Any],
+    create_agent: bool,
+    schema_file: Optional[Path],
+    env_file: Optional[Path],
+    project_dir: Path
+) -> None:
+    """Deploys a directory as a bundle with state tracking."""
+    # Load schemas and environment variables for bundle
+    input_schema, output_schema, memory_template = load_schemas(source_dir, schema_file)
+    env_variables = load_env_variables(source_dir, env_file)
+    
+    definition_id = None
+    agent_id = None
+    
+    if deploy_mode == "create":
+        # Create new bundle
+        typer.echo("Creating and deploying new bundle...")
+        agent_definition = client.create_and_upload_bundle(
+            source_dir=str(source_dir),
+            name=agent_name,
+            description=description,
+            input_schema=input_schema if input_schema else None,
+            output_schema=output_schema if output_schema else None,
+            shareable=False
+        )
+        definition_id = agent_definition.id
+        typer.secho(f"Agent Definition '{agent_definition.name}' created (ID: {definition_id}).", fg=typer.colors.GREEN)
+    
+    elif deploy_mode in ["update", "redeploy"]:
+        existing_definition = existing_data["definition"]
+        definition_id = existing_definition.id
+        
+        # Create new bundle and update existing definition
+        typer.echo(f"Updating existing bundle definition (ID: {definition_id})...")
+        bundle_path = client.create_bundle(
+            source_dir=str(source_dir),
+            include_requirements=True,
+            install_dependencies=True
+        )
+        
+        try:
+            updated_definition = client.update_agent_bundle(
+                definition_id=definition_id,
+                bundle_path=bundle_path
+            )
+            typer.secho(f"Agent Definition '{updated_definition.name}' updated (ID: {updated_definition.id}).", fg=typer.colors.GREEN)
+        finally:
+            # Clean up temporary bundle
+            try:
+                os.remove(bundle_path)
+            except:
+                pass
+    
+    # Handle agent creation/update
+    if create_agent and definition_id:
+        if deploy_mode == "update" and "agent" in existing_data:
+            existing_agent = existing_data["agent"]
+            agent_id = existing_agent.id
+            typer.echo(f"Updating existing Agent (ID: {agent_id})...")
+            agent_update_data = AgentUpdate(
+                name=agent_name,
+                description=description or existing_agent.description,
+                agent_definition_id=definition_id,
+                agent_type=agent_type,
+                secrets=env_variables if env_variables else None
+            )
+            updated_agent = client.update_agent(agent_id, agent_update_data)
+            typer.secho(f"Agent '{updated_agent.name}' updated (ID: {updated_agent.id}).", fg=typer.colors.GREEN)
+        else:
+            typer.echo(f"Creating new Agent linked to definition {definition_id}...")
+            agent_payload = AgentCreate(
+                name=agent_name,
+                description=description,
+                agent_type=agent_type,
+                agent_definition_id=definition_id,
+                secrets=env_variables if env_variables else None
+            )
+            created_agent = client.create_agent(agent_payload)
+            agent_id = created_agent.id
+            typer.secho(f"Agent '{created_agent.name}' created (ID: {agent_id}).", fg=typer.colors.GREEN)
+    
+    # Save state
+    state_data = {
+        "agent_name": agent_name,
+        "agent_definition_id": str(definition_id) if definition_id else None,
+        "agent_id": str(agent_id) if agent_id else None,
+        "last_deploy_mode": deploy_mode,
+        "last_deployed_at": datetime.now().isoformat()
+    }
+    save_project_state(state_data, project_dir)
+    
+    typer.secho("Bundle deployment completed successfully!", fg=typer.colors.GREEN)
+    if definition_id:
+        typer.echo(f"  Definition ID: {definition_id}")
+    if agent_id:
+        typer.echo(f"  Agent ID: {agent_id}")
+    typer.echo(f"  Project state saved to {project_dir / PROJECT_STATE_FILE}")
 
 # --- Typer App ---
 app = typer.Typer(
@@ -218,17 +583,12 @@ def setup(
 
 @app.command()
 def deploy(
-    file_path: Annotated[Path, typer.Argument(
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-        readable=True,
-        resolve_path=True,
-        help="Path to the Python file containing the agent code.",
-    )],
+    file_path: Annotated[Optional[Path], typer.Argument(
+        help="Path to the Python file or directory containing agent code. If not provided, uses current directory.",
+    )] = None,
     name: Annotated[Optional[str], typer.Option(
         "--name", "-n",
-        help="Name for the Agent Definition and Agent. Defaults to the filename without extension."
+        help="Name for the Agent Definition and Agent. Defaults to the filename or directory name."
     )] = None,
     description: Annotated[Optional[str], typer.Option(
         "--desc", "-d",
@@ -236,234 +596,276 @@ def deploy(
     )] = None,
     agent_type: Annotated[str, typer.Option(
         "--agent-type", "-t",
-        help="Type of the agent (e.g., 'script', 'chat', 'tool'). Required if creating an agent."
+        help="Type of the agent (e.g., 'script', 'chat', 'tool')."
     )] = "script", 
-    update: Annotated[bool, typer.Option(
-        "--update", "-u",
-        help="Update existing Agent Definition and Agent if found with the same name.",
-    )] = False,
-    create_agent_flag: Annotated[bool, typer.Option(
-        "--create-agent/--no-create-agent", # Creates a boolean flag
-        help="Create/update an Agent instance linked to the definition.",
-    )] = False,
+    force_mode: Annotated[Optional[str], typer.Option(
+        "--mode",
+        help="Force deployment mode: 'create', 'update', or 'redeploy'. Auto-detected if not specified."
+    )] = None,
+    create_agent: Annotated[bool, typer.Option(
+        "--create-agent/--definition-only",
+        help="Create/update an Agent instance linked to the definition (default: True).",
+    )] = True,
     schema_file: Annotated[Optional[Path], typer.Option(
         "--schema-file", 
-        help="Path to a JSON file containing input/output/memory schemas. Defaults to [agent_name].json."
+        help="Path to a JSON file containing input/output/memory schemas. Auto-detected if not specified."
     )] = None,
     env_file: Annotated[Optional[Path], typer.Option(
         "--env-file", 
-        help="Path to a .env file containing environment variables. Defaults to .env in the same directory."
+        help="Path to a .env file containing environment variables. Auto-detected if not specified."
     )] = None,
-    # Add shared options via dependencies= parameter or manually
+    # Add shared options
     org_id: Annotated[Optional[UUID], typer.Option("--org-id", help="Maestro Organization ID (Overrides env var).")] = None,
     url: Annotated[Optional[str], typer.Option("--url", help="Maestro API Base URL (Overrides env var).")] = None,
     token: Annotated[Optional[str], typer.Option("--token", help="Maestro Auth Token (Overrides env var).")] = None,
 
 ):
     """
-    Deploys a Python file as a Maestro Agent Definition and optionally an Agent.
+    Intelligently deploys agent code as a Maestro Agent Definition and Agent.
     
-    Automatically loads schemas from a JSON file with the same name as the Python file (if it exists).
-    The JSON file should have keys: 'input', 'output', and 'memory'.
-    
-    Also loads environment variables from a .env file in the same directory.
+    Automatically detects whether to create, update, or redeploy based on existing state.
+    Supports both single Python files and directory-based agent bundles.
+    Automatically loads schemas and environment variables from conventional locations.
     """
-    client = get_client(org_id, url, token) # Use the helper to get configured client
+    client = get_client(org_id, url, token)
+    
+    # Handle file_path - if not provided, use current directory
+    if file_path is None:
+        file_path = Path.cwd()
+    
+    # Validate path exists
+    if not file_path.exists():
+        typer.secho(f"Error: Path '{file_path}' does not exist.", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    
+    # Determine if we're dealing with a file or directory
+    is_bundle = file_path.is_dir()
+    project_dir = file_path if is_bundle else file_path.parent
+    
+    # Determine agent name
+    if is_bundle:
+        agent_name = name or file_path.name
+        typer.echo(f"Deploying agent bundle from '{file_path}' as '{agent_name}'...")
+    else:
+        if not file_path.is_file() or not file_path.suffix == '.py':
+            typer.secho(f"Error: File path must be a Python file (.py) or a directory.", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+        agent_name = name or file_path.stem
+        typer.echo(f"Deploying agent from '{file_path.name}' as '{agent_name}'...")
+    
+    # Determine deployment mode
+    deploy_mode, existing_data = get_deploy_mode(client, agent_name, project_dir)
+    if force_mode:
+        if force_mode not in ["create", "update", "redeploy"]:
+            typer.secho(f"Error: Invalid mode '{force_mode}'. Must be 'create', 'update', or 'redeploy'.", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+        deploy_mode = force_mode
+        typer.echo(f"Using forced deployment mode: {deploy_mode}")
+    else:
+        typer.echo(f"Auto-detected deployment mode: {deploy_mode}")
 
-    # Determine default name if not provided
-    agent_name = name or file_path.stem # e.g., "agent_example" from "agent_example.py"
-    typer.echo(f"Deploying agent from '{file_path.name}' as '{agent_name}'...")
-
+    # Handle bundle vs single file deployment
+    if is_bundle:
+        # Use bundle deployment for directories
+        return deploy_bundle_with_state(
+            client=client,
+            source_dir=file_path,
+            agent_name=agent_name,
+            description=description,
+            agent_type=agent_type,
+            deploy_mode=deploy_mode,
+            existing_data=existing_data,
+            create_agent=create_agent,
+            schema_file=schema_file,
+            env_file=env_file,
+            project_dir=project_dir
+        )
+    
+    # Single file deployment
     try:
-        # Read the agent code
         agent_code = file_path.read_text()
     except Exception as e:
         typer.secho(f"Error reading file '{file_path}': {e}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
     
-    # Initialize the schemas and environment variables
-    input_schema = {}
-    output_schema = {}
-    memory_template = {}
-    env_variables = {}
-    
-    # Try to load schemas from JSON file with same name if no specific file is provided
-    if not schema_file:
-        default_schema_file = file_path.with_suffix('.json')
-        if default_schema_file.exists():
-            schema_file = default_schema_file
-    
-    # Load schemas from the JSON file if it exists
-    if schema_file and schema_file.exists():
-        try:
-            typer.echo(f"Loading schemas from '{schema_file}'...")
-            with open(schema_file, 'r') as f:
-                schema_data = json.load(f)
-                
-            # Extract schemas from the file
-            if 'input' in schema_data:
-                input_schema = schema_data['input']
-                typer.echo("Input schema loaded.")
-            
-            if 'output' in schema_data:
-                output_schema = schema_data['output']
-                typer.echo("Output schema loaded.")
-            
-            if 'memory' in schema_data:
-                memory_template = schema_data['memory']
-                typer.echo("Memory template loaded.")
-        except json.JSONDecodeError as e:
-            typer.secho(f"Error parsing JSON file '{schema_file}': {e}", fg=typer.colors.RED, err=True)
-            typer.secho("Continuing with default empty schemas.", fg=typer.colors.YELLOW)
-        except Exception as e:
-            typer.secho(f"Error reading schema file '{schema_file}': {e}", fg=typer.colors.RED, err=True)
-            typer.secho("Continuing with default empty schemas.", fg=typer.colors.YELLOW)
-    
-    # Try to load environment variables from .env file
-    if not env_file:
-        default_env_file = file_path.parent / '.env'
-        if default_env_file.exists():
-            env_file = default_env_file
-    
-    if env_file and env_file.exists():
-        try:
-            typer.echo(f"Loading environment variables from '{env_file}'...")
-            env_variables = dotenv.dotenv_values(env_file)
-            if env_variables:
-                typer.echo(f"Loaded {len(env_variables)} environment variables.")
-            else:
-                typer.echo("No environment variables found in .env file.")
-        except Exception as e:
-            typer.secho(f"Error reading .env file '{env_file}': {e}", fg=typer.colors.RED, err=True)
-            typer.secho("Continuing without environment variables.", fg=typer.colors.YELLOW)
+    # Load schemas and environment variables
+    input_schema, output_schema, memory_template = load_schemas(file_path, schema_file)
+    env_variables = load_env_variables(file_path.parent, env_file)
 
-    existing_definition: Optional[AgentDefinition] = None
-    existing_agent: Optional[Agent] = None
+    # Deploy based on mode
+    definition_id, agent_id = deploy_single_file(
+        client=client,
+        agent_code=agent_code,
+        agent_name=agent_name,
+        description=description,
+        agent_type=agent_type,
+        deploy_mode=deploy_mode,
+        existing_data=existing_data,
+        create_agent=create_agent,
+        input_schema=input_schema,
+        output_schema=output_schema,
+        memory_template=memory_template,
+        env_variables=env_variables
+    )
+    
+    # Save state for future deployments
+    state_data = {
+        "agent_name": agent_name,
+        "agent_definition_id": str(definition_id) if definition_id else None,
+        "agent_id": str(agent_id) if agent_id else None,
+        "last_deploy_mode": deploy_mode,
+        "last_deployed_at": datetime.now().isoformat()
+    }
+    save_project_state(state_data, project_dir)
+    
+    typer.secho("Deployment completed successfully!", fg=typer.colors.GREEN)
+    if definition_id:
+        typer.echo(f"  Definition ID: {definition_id}")
+    if agent_id:
+        typer.echo(f"  Agent ID: {agent_id}")
+    typer.echo(f"  Project state saved to {project_dir / PROJECT_STATE_FILE}")
 
-    # --- Check for Existing Definition ---
+@app.command(name="list-agents")
+def list_agents_cmd(
+    show_definition: Annotated[bool, typer.Option(
+        "--show-def", 
+        help="Show agent definition information"
+    )] = False,
+    # Add shared options
+    org_id: Annotated[Optional[UUID], typer.Option("--org-id", help="Maestro Organization ID (Overrides env var).")] = None,
+    url: Annotated[Optional[str], typer.Option("--url", help="Maestro API Base URL (Overrides env var).")] = None,
+    token: Annotated[Optional[str], typer.Option("--token", help="Maestro Auth Token (Overrides env var).")] = None,
+):
+    """
+    List all agents in the current organization.
+    """
+    client = get_client(org_id, url, token)
+    
     try:
-        typer.echo(f"Checking for existing definition named '{agent_name}'...")
-        all_definitions = client.list_agent_definitions() # TODO: Optimize if API supports filtering by name
-        existing_definition = next((d for d in all_definitions if d.name == agent_name), None)
+        agents = client.list_agents()
+        
+        if not agents:
+            typer.echo("No agents found.")
+            return
+        
+        typer.echo(f"Found {len(agents)} agent(s):")
+        typer.echo()
+        
+        for agent in agents:
+            typer.echo(f"• {agent.name} (ID: {agent.id})")
+            if agent.description:
+                typer.echo(f"  Description: {agent.description}")
+            typer.echo(f"  Type: {agent.agent_type}")
+            typer.echo(f"  Created: {agent.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            if show_definition and agent.agent_definition_id:
+                try:
+                    definition = client.get_agent_definition(agent.agent_definition_id)
+                    typer.echo(f"  Definition: {definition.name} (ID: {agent.agent_definition_id})")
+                except:
+                    typer.echo(f"  Definition ID: {agent.agent_definition_id}")
+            
+            typer.echo()
+    
     except MaestroApiError as e:
-         typer.secho(f"API Error checking for definition: {e}", fg=typer.colors.RED, err=True)
-         raise typer.Exit(code=1)
-
-    definition_id: Optional[UUID] = None
-
-    # --- Create or Update Definition ---
-    try:
-        if existing_definition:
-            definition_id = existing_definition.id
-            if not update:
-                typer.secho(f"Error: Agent Definition '{agent_name}' already exists (ID: {definition_id}). Use --update to overwrite.", fg=typer.colors.RED, err=True)
-                raise typer.Exit(code=1)
-
-            typer.echo(f"Updating existing Agent Definition (ID: {definition_id})...")
-            # Create payload using existing definition fields as defaults
-            definition_payload = AgentDefinitionCreate(
-                name=agent_name,
-                description=description or existing_definition.description, # Keep old desc if none provided
-                definition=agent_code,
-                definition_type='python', # Assuming python
-                input_schema=input_schema or existing_definition.input_schema,
-                output_schema=output_schema or existing_definition.output_schema,
-                memory_template=memory_template or existing_definition.memory_template,
-                environment_variables=env_variables or existing_definition.environment_variables,
-            )
-            # Call the client's update method
-            updated_def = client.update_agent_definition(definition_id, definition_payload)
-            typer.secho(f"Agent Definition '{updated_def.name}' updated (ID: {updated_def.id}).", fg=typer.colors.GREEN)
-
-        else:
-            typer.echo("Creating new Agent Definition...")
-            definition_payload = AgentDefinitionCreate(
-                name=agent_name,
-                description=description,
-                definition=agent_code,
-                definition_type='python',
-                input_schema=input_schema,
-                output_schema=output_schema,
-                memory_template=memory_template,
-                environment_variables=env_variables,
-            )
-            created_def = client.create_agent_definition(definition_payload)
-            definition_id = created_def.id
-            typer.secho(f"Agent Definition '{created_def.name}' created (ID: {definition_id}).", fg=typer.colors.GREEN)
-
-    except (MaestroValidationError, MaestroApiError) as e:
-        typer.secho(f"API Error creating/updating definition: {e}", fg=typer.colors.RED, err=True)
+        typer.secho(f"API Error listing agents: {e}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
-    except Exception as e:
-         typer.secho(f"Unexpected error during definition operation: {e}", fg=typer.colors.RED, err=True)
-         raise typer.Exit(code=1)
 
+@app.command(name="list-definitions")
+def list_definitions_cmd(
+    # Add shared options
+    org_id: Annotated[Optional[UUID], typer.Option("--org-id", help="Maestro Organization ID (Overrides env var).")] = None,
+    url: Annotated[Optional[str], typer.Option("--url", help="Maestro API Base URL (Overrides env var).")] = None,
+    token: Annotated[Optional[str], typer.Option("--token", help="Maestro Auth Token (Overrides env var).")] = None,
+):
+    """
+    List all agent definitions in the current organization.
+    """
+    client = get_client(org_id, url, token)
+    
+    try:
+        definitions = client.list_agent_definitions()
+        
+        if not definitions:
+            typer.echo("No agent definitions found.")
+            return
+        
+        typer.echo(f"Found {len(definitions)} definition(s):")
+        typer.echo()
+        
+        for definition in definitions:
+            typer.echo(f"• {definition.name} (ID: {definition.id})")
+            if definition.description:
+                typer.echo(f"  Description: {definition.description}")
+            typer.echo(f"  Type: {definition.definition_type or 'python'}")
+            typer.echo(f"  Created: {definition.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
+            typer.echo()
+    
+    except MaestroApiError as e:
+        typer.secho(f"API Error listing definitions: {e}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
 
-    # --- Create or Update Agent (if requested) ---
-    if create_agent_flag and definition_id:
-        if not agent_type:
-             typer.secho("Error: --agent-type is required when creating/updating an agent.", fg=typer.colors.RED, err=True)
-             raise typer.Exit(code=1)
-
-        # Check for existing agent with the same name
-        try:
-            typer.echo(f"Checking for existing agent named '{agent_name}'...")
-            all_agents = client.list_agents() # TODO: Optimize if API supports filtering by name
-            existing_agent = next((a for a in all_agents if a.name == agent_name), None)
-        except MaestroApiError as e:
-             typer.secho(f"API Error checking for agent: {e}", fg=typer.colors.RED, err=True)
-             raise typer.Exit(code=1)
-
-        agent_id: Optional[UUID] = None
-
-        try:
-            if existing_agent:
-                agent_id = existing_agent.id
-                if not update:
-                     typer.secho(f"Error: Agent '{agent_name}' already exists (ID: {agent_id}). Use --update to modify.", fg=typer.colors.RED, err=True)
-                   
-                     return # Stop processing agent
-
-                typer.echo(f"Updating existing Agent (ID: {agent_id}) to use definition {definition_id}...")
-                # Prepare agent update data
-                agent_update_data = AgentUpdate(
-                    name=agent_name,
-                    description=description or existing_agent.description,
-                    agent_definition_id=definition_id,
-                    agent_type=agent_type or existing_agent.agent_type,
-                    capabilities=existing_agent.capabilities,
-                    agent_metadata=existing_agent.agent_metadata
-                )
-                # Call the client's update method
-                updated_agent = client.update_agent(agent_id, agent_update_data)
-                typer.secho(f"Agent '{updated_agent.name}' updated (ID: {updated_agent.id}).", fg=typer.colors.GREEN)
-
-
-            else:
-                typer.echo(f"Creating new Agent linked to definition {definition_id}...")
-                agent_payload = AgentCreate(
-                    name=agent_name,
-                    description=description,
-                    agent_type=agent_type,
-                    agent_definition_id=definition_id,
-
-              
-                )
-                created_agent = client.create_agent(agent_payload)
-                agent_id = created_agent.id
-                typer.secho(f"Agent '{created_agent.name}' created (ID: {agent_id}).", fg=typer.colors.GREEN)
-
-        except (MaestroValidationError, MaestroApiError) as e:
-            typer.secho(f"API Error creating/updating agent: {e}", fg=typer.colors.RED, err=True)
-         
-        except Exception as e:
-            typer.secho(f"Unexpected error during agent operation: {e}", fg=typer.colors.RED, err=True)
-            # raise typer.Exit(code=1)
-
-    elif not create_agent_flag:
-         typer.echo("Skipping agent creation/update (--create-agent not specified).")
-
-    typer.echo("Deployment process finished.")
+@app.command()
+def status(
+    # Add shared options
+    org_id: Annotated[Optional[UUID], typer.Option("--org-id", help="Maestro Organization ID (Overrides env var).")] = None,
+    url: Annotated[Optional[str], typer.Option("--url", help="Maestro API Base URL (Overrides env var).")] = None,
+    token: Annotated[Optional[str], typer.Option("--token", help="Maestro Auth Token (Overrides env var).")] = None,
+):
+    """
+    Show status of the current project and connected agents.
+    """
+    client = get_client(org_id, url, token)
+    
+    typer.echo("🤖 DantaLabs Maestro CLI Status")
+    typer.echo("=" * 40)
+    
+    # Show current configuration
+    config = load_config()
+    typer.echo(f"📍 API URL: {config.get('base_url', 'Not configured')}")
+    typer.echo(f"🏢 Organization ID: {config.get('organization_id', 'Not configured')}")
+    
+    # Show project state
+    project_state = load_project_state()
+    if project_state:
+        typer.echo("\n📁 Current Project:")
+        typer.echo(f"  Agent Name: {project_state.get('agent_name', 'N/A')}")
+        typer.echo(f"  Definition ID: {project_state.get('agent_definition_id', 'N/A')}")
+        typer.echo(f"  Agent ID: {project_state.get('agent_id', 'N/A')}")
+        typer.echo(f"  Last Deploy Mode: {project_state.get('last_deploy_mode', 'N/A')}")
+        if project_state.get('last_deployed_at'):
+            typer.echo(f"  Last Deployed: {project_state['last_deployed_at']}")
+        
+        # Try to fetch current status of the agent
+        definition_id = project_state.get('agent_definition_id')
+        agent_id = project_state.get('agent_id')
+        
+        if definition_id:
+            try:
+                definition = client.get_agent_definition(UUID(definition_id))
+                typer.echo(f"  ✅ Definition exists: {definition.name}")
+            except:
+                typer.echo(f"  ❌ Definition not found (may have been deleted)")
+        
+        if agent_id:
+            try:
+                agent = client.get_agent(UUID(agent_id))
+                typer.echo(f"  ✅ Agent exists: {agent.name} ({agent.agent_type})")
+            except:
+                typer.echo(f"  ❌ Agent not found (may have been deleted)")
+    else:
+        typer.echo("\n📁 No project state found in current directory")
+        typer.echo("   Run 'dlm deploy' to deploy an agent from this directory")
+    
+    # Show API connectivity
+    typer.echo("\n🌐 API Connectivity:")
+    try:
+        if client.health_check():
+            typer.secho("  ✅ API is reachable and healthy", fg=typer.colors.GREEN)
+        else:
+            typer.secho("  ❌ API health check failed", fg=typer.colors.RED)
+    except:
+        typer.secho("  ❌ Cannot reach API", fg=typer.colors.RED)
 
 @app.command()
 def create_agent(
@@ -958,6 +1360,10 @@ def create_bundle(
         "--no-requirements",
         help="Skip automatic inclusion of requirements from pyproject.toml or requirements.txt."
     )] = False,
+    no_install_deps: Annotated[bool, typer.Option(
+        "--no-install-deps",
+        help="Skip automatic installation of dependencies into the bundle. Only include requirements.txt instead."
+    )] = False,
     # Add shared options
     org_id: Annotated[Optional[UUID], typer.Option("--org-id", help="Maestro Organization ID (Overrides env var).")] = None,
     url: Annotated[Optional[str], typer.Option("--url", help="Maestro API Base URL (Overrides env var).")] = None,
@@ -967,7 +1373,8 @@ def create_bundle(
     Create a ZIP bundle from a source directory for agent deployment.
     
     The bundle will include all files from the source directory and automatically
-    include requirements from pyproject.toml or requirements.txt files if found.
+    install dependencies from pyproject.toml or requirements.txt files if found.
+    Dependencies are installed directly into the bundle as Python libraries.
     """
     client = get_client(org_id, url, token)
     
@@ -988,6 +1395,7 @@ def create_bundle(
             source_dir=str(source_dir),
             output_path=str(output_path) if output_path else None,
             include_requirements=not no_requirements,
+            install_dependencies=not no_install_deps,
             maestro_config=maestro_config
         )
         
@@ -1025,10 +1433,30 @@ def upload_bundle(
         "--desc", "-d",
         help="Optional description for the Agent Definition."
     )] = None,
+    entrypoint: Annotated[str, typer.Option(
+        "--entrypoint", "-e",
+        help="Main entry point file for the bundle."
+    )] = "main.py",
+    version: Annotated[str, typer.Option(
+        "--version", "-v",
+        help="Version of the bundle."
+    )] = "1.0.0",
+    requirements_file: Annotated[Optional[Path], typer.Option(
+        "--requirements-file",
+        help="Path to a requirements.txt file to include as bundle requirements."
+    )] = None,
     schema_file: Annotated[Optional[Path], typer.Option(
         "--schema-file",
         help="Path to a JSON file containing input/output schemas."
     )] = None,
+    metadata_file: Annotated[Optional[Path], typer.Option(
+        "--metadata-file",
+        help="Path to a JSON file containing additional metadata."
+    )] = None,
+    shareable: Annotated[bool, typer.Option(
+        "--shareable/--no-shareable",
+        help="Whether the agent definition is shareable."
+    )] = False,
     create_agent_flag: Annotated[bool, typer.Option(
         "--create-agent/--no-create-agent",
         help="Create an Agent instance linked to the definition."
@@ -1045,6 +1473,10 @@ def upload_bundle(
     org_id: Annotated[Optional[UUID], typer.Option("--org-id", help="Maestro Organization ID (Overrides env var).")] = None,
     url: Annotated[Optional[str], typer.Option("--url", help="Maestro API Base URL (Overrides env var).")] = None,
     token: Annotated[Optional[str], typer.Option("--token", help="Maestro Auth Token (Overrides env var).")] = None,
+    timeout: Annotated[Optional[int], typer.Option(
+        "--upload-timeout",
+        help="Timeout in seconds for the upload bundle request (default: 600)."
+    )] = None,
 ):
     """
     Upload a ZIP bundle to create a new Agent Definition.
@@ -1078,15 +1510,51 @@ def upload_bundle(
             typer.secho(f"Error reading schema file '{schema_file}': {e}", fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1)
     
+    # Load requirements if provided
+    requirements = None
+    if requirements_file and requirements_file.exists():
+        try:
+            typer.echo(f"Loading requirements from '{requirements_file}'...")
+            with open(requirements_file, 'r') as f:
+                requirements_content = f.read().strip()
+            requirements = [req.strip() for req in requirements_content.split('\n') if req.strip()]
+            typer.echo(f"Loaded {len(requirements)} requirements.")
+        except Exception as e:
+            typer.secho(f"Error reading requirements file '{requirements_file}': {e}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+    
+    # Load additional metadata if provided
+    additional_metadata = None
+    if metadata_file and metadata_file.exists():
+        try:
+            typer.echo(f"Loading additional metadata from '{metadata_file}'...")
+            with open(metadata_file, 'r') as f:
+                additional_metadata = json.load(f)
+            typer.echo("Additional metadata loaded.")
+        except json.JSONDecodeError as e:
+            typer.secho(f"Error parsing JSON file '{metadata_file}': {e}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+        except Exception as e:
+            typer.secho(f"Error reading metadata file '{metadata_file}': {e}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+    
     try:
         typer.echo(f"Uploading bundle '{bundle_path.name}' as Agent Definition '{name}'...")
+        timeout_value = timeout if timeout else 600
+        typer.echo(f"This may take several minutes... (timeout: {timeout_value} seconds)")
         
         agent_definition = client.upload_agent_bundle(
             bundle_path=str(bundle_path),
             name=name,
             description=description,
             input_schema=input_schema if input_schema else None,
-            output_schema=output_schema if output_schema else None
+            output_schema=output_schema if output_schema else None,
+            entrypoint=entrypoint,
+            version=version,
+            requirements=requirements,
+            additional_metadata=additional_metadata,
+            shareable=shareable,
+            upload_timeout=timeout if timeout else 600.0
         )
         
         typer.secho(f"Agent Definition '{agent_definition.name}' created successfully (ID: {agent_definition.id})", fg=typer.colors.GREEN)
@@ -1163,6 +1631,18 @@ def deploy_bundle(
         "--schema-file",
         help="Path to a JSON file containing input/output schemas."
     )] = None,
+    requirements_file: Annotated[Optional[Path], typer.Option(
+        "--requirements-file",
+        help="Path to a requirements.txt file to include as bundle requirements."
+    )] = None,
+    metadata_file: Annotated[Optional[Path], typer.Option(
+        "--metadata-file",
+        help="Path to a JSON file containing additional metadata."
+    )] = None,
+    shareable: Annotated[bool, typer.Option(
+        "--shareable/--no-shareable",
+        help="Whether the agent definition is shareable."
+    )] = False,
     create_agent_flag: Annotated[bool, typer.Option(
         "--create-agent/--no-create-agent",
         help="Create an Agent instance linked to the definition."
@@ -1179,16 +1659,25 @@ def deploy_bundle(
         "--no-requirements",
         help="Skip automatic inclusion of requirements from pyproject.toml or requirements.txt."
     )] = False,
+    no_install_deps: Annotated[bool, typer.Option(
+        "--no-install-deps",
+        help="Skip automatic installation of dependencies into the bundle. Only include requirements.txt instead."
+    )] = False,
     # Add shared options
     org_id: Annotated[Optional[UUID], typer.Option("--org-id", help="Maestro Organization ID (Overrides env var).")] = None,
     url: Annotated[Optional[str], typer.Option("--url", help="Maestro API Base URL (Overrides env var).")] = None,
     token: Annotated[Optional[str], typer.Option("--token", help="Maestro Auth Token (Overrides env var).")] = None,
+    timeout: Annotated[Optional[int], typer.Option(
+        "--upload-timeout",
+        help="Timeout in seconds for the upload bundle request (default: 600)."
+    )] = None,
 ):
     """
     Create and deploy a bundle from a source directory in one command.
     
     This combines bundle creation and upload into a single operation.
     Automatically loads schemas and secrets from the source directory.
+    Dependencies are installed directly into the bundle as Python libraries.
     """
     client = get_client(org_id, url, token)
     
@@ -1222,6 +1711,37 @@ def deploy_bundle(
             typer.secho(f"Error loading schemas: {e}", fg=typer.colors.YELLOW, err=True)
             typer.echo("Continuing without schemas.")
     
+    # Load requirements if provided or look for default
+    requirements = None
+    if not requirements_file and not no_requirements:
+        # Look for default requirements files in source directory
+        default_req_file = source_dir / 'requirements.txt'
+        if default_req_file.exists():
+            requirements_file = default_req_file
+    
+    if requirements_file and requirements_file.exists():
+        try:
+            typer.echo(f"Loading requirements from '{requirements_file}'...")
+            with open(requirements_file, 'r') as f:
+                requirements_content = f.read().strip()
+            requirements = [req.strip() for req in requirements_content.split('\n') if req.strip()]
+            typer.echo(f"Loaded {len(requirements)} requirements.")
+        except Exception as e:
+            typer.secho(f"Error reading requirements file '{requirements_file}': {e}", fg=typer.colors.YELLOW, err=True)
+            typer.echo("Continuing without explicit requirements.")
+    
+    # Load additional metadata if provided
+    additional_metadata = None
+    if metadata_file and metadata_file.exists():
+        try:
+            typer.echo(f"Loading additional metadata from '{metadata_file}'...")
+            with open(metadata_file, 'r') as f:
+                additional_metadata = json.load(f)
+            typer.echo("Additional metadata loaded.")
+        except Exception as e:
+            typer.secho(f"Error loading additional metadata: {e}", fg=typer.colors.YELLOW, err=True)
+            typer.echo("Continuing without additional metadata.")
+    
     # Load secrets from .env file
     secrets = {}
     
@@ -1248,6 +1768,8 @@ def deploy_bundle(
     
     try:
         typer.echo(f"Creating and deploying bundle from '{source_dir}' as '{agent_name}'...")
+        timeout_value = timeout if timeout else 600
+        typer.echo(f"This includes dependency installation and upload, which may take several minutes... (upload timeout: {timeout_value} seconds)")
         
         agent_definition = client.create_and_upload_bundle(
             source_dir=str(source_dir),
@@ -1255,8 +1777,15 @@ def deploy_bundle(
             description=description,
             input_schema=input_schema if input_schema else None,
             output_schema=output_schema if output_schema else None,
+            entrypoint=entrypoint,
+            version=version,
+            requirements=requirements,
+            additional_metadata=additional_metadata,
+            shareable=shareable,
             include_requirements=not no_requirements,
-            maestro_config=maestro_config
+            install_dependencies=not no_install_deps,
+            maestro_config=maestro_config,
+            upload_timeout=timeout if timeout else 600.0
         )
         
         typer.secho(f"Agent Definition '{agent_definition.name}' created successfully (ID: {agent_definition.id})", fg=typer.colors.GREEN)
@@ -1296,13 +1825,33 @@ def update_bundle(
         resolve_path=True,
         help="Path to the new ZIP bundle file.",
     )],
+    entrypoint: Annotated[Optional[str], typer.Option(
+        "--entrypoint", "-e",
+        help="Update the main entry point file for the bundle."
+    )] = None,
+    version: Annotated[Optional[str], typer.Option(
+        "--version", "-v",
+        help="Update the version of the bundle."
+    )] = None,
+    requirements_file: Annotated[Optional[Path], typer.Option(
+        "--requirements-file",
+        help="Path to a requirements.txt file to update bundle requirements."
+    )] = None,
+    metadata_file: Annotated[Optional[Path], typer.Option(
+        "--metadata-file",
+        help="Path to a JSON file containing additional metadata to update."
+    )] = None,
     # Add shared options
     org_id: Annotated[Optional[UUID], typer.Option("--org-id", help="Maestro Organization ID (Overrides env var).")] = None,
     url: Annotated[Optional[str], typer.Option("--url", help="Maestro API Base URL (Overrides env var).")] = None,
     token: Annotated[Optional[str], typer.Option("--token", help="Maestro Auth Token (Overrides env var).")] = None,
+    timeout: Annotated[Optional[int], typer.Option(
+        "--upload-timeout",
+        help="Timeout in seconds for the upload bundle request (default: 600)."
+    )] = None,
 ):
     """
-    Update an existing bundled Agent Definition with a new ZIP bundle.
+    Update an existing bundled Agent Definition with a new ZIP bundle and optional metadata.
     """
     client = get_client(org_id, url, token)
     
@@ -1313,12 +1862,47 @@ def update_bundle(
         typer.secho(f"Error: '{definition_id}' is not a valid UUID.", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
     
+    # Load requirements if provided
+    requirements = None
+    if requirements_file and requirements_file.exists():
+        try:
+            typer.echo(f"Loading requirements from '{requirements_file}'...")
+            with open(requirements_file, 'r') as f:
+                requirements_content = f.read().strip()
+            requirements = [req.strip() for req in requirements_content.split('\n') if req.strip()]
+            typer.echo(f"Loaded {len(requirements)} requirements.")
+        except Exception as e:
+            typer.secho(f"Error reading requirements file '{requirements_file}': {e}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+    
+    # Load additional metadata if provided
+    additional_metadata = None
+    if metadata_file and metadata_file.exists():
+        try:
+            typer.echo(f"Loading additional metadata from '{metadata_file}'...")
+            with open(metadata_file, 'r') as f:
+                additional_metadata = json.load(f)
+            typer.echo("Additional metadata loaded.")
+        except json.JSONDecodeError as e:
+            typer.secho(f"Error parsing JSON file '{metadata_file}': {e}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+        except Exception as e:
+            typer.secho(f"Error reading metadata file '{metadata_file}': {e}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+    
     try:
         typer.echo(f"Updating Agent Definition {definition_uuid} with bundle '{bundle_path.name}'...")
+        timeout_value = timeout if timeout else 600
+        typer.echo(f"This may take several minutes... (timeout: {timeout_value} seconds)")
         
         updated_definition = client.update_agent_bundle(
             definition_id=definition_uuid,
-            bundle_path=str(bundle_path)
+            bundle_path=str(bundle_path),
+            entrypoint=entrypoint,
+            version=version,
+            requirements=requirements,
+            additional_metadata=additional_metadata,
+            upload_timeout=timeout if timeout else 600.0
         )
         
         typer.secho(f"Agent Definition '{updated_definition.name}' updated successfully", fg=typer.colors.GREEN)
@@ -1374,6 +1958,11 @@ def download_definition_bundle(
     except Exception as e:
         typer.secho(f"Error downloading bundle: {e}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
+
+
+@app.command()
+def version():
+    typer.echo(VERSION)
 
 if __name__ == "__main__":
     app()
