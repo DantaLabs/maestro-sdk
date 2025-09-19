@@ -1,0 +1,54 @@
+import React from 'react';
+
+# Welcome to the Maestro SDK
+
+Maestro is DantaLabs' agent platform for building, deploying, and operating AI systems. The SDK in this repository bundles the Python client, an opinionated CLI, and helper utilities for packaging container workloads that run on Maestro infrastructure. Learn more about the broader platform and roadmap at [https://dantalabs.com](https://dantalabs.com).
+
+## Why Maestro?
+
+- **Container-first agents** – Package code, models, and dependencies exactly as you would for your own microservices. Maestro builds the image, hosts it, and injects operational primitives.
+- **Managed databases** – Every agent receives an isolated PostgreSQL database. Connection strings and credentials are mounted into the container as environment variables so your code can connect without hard-coded secrets.
+- **Secure service token** – A short-lived Maestro API token is injected at runtime, enabling the agent to call Maestro services with the official `MaestroClient` without you storing long-lived keys.
+
+## Platform Snapshot
+
+| Capability | Description |
+| --- | --- |
+| Deployments | Unified pipeline that uploads your project, builds a container image, and exposes it behind a managed HTTPS endpoint |
+| Execution | Run agents synchronously (script mode) or as auto-scaled services behind process-style HTTP routes |
+| Databases | Automatically provisioned per agent, with CLI helpers to inspect, connect, and share credentials with the runtime |
+| Observability | Fetch deployment status, streaming logs, metrics, and health via CLI or client |
+
+## Current Limitations & Roadmap
+
+- **Agent networks** and **first-class model APIs** are in active development and will appear in upcoming releases. Early documentation is available in the Networks section but APIs are not public yet.
+- Container agents must expose port **8080** and respond with `200 OK` at `/health`. Future releases may allow custom probes.
+
+## Installing the SDK
+
+```bash
+python -m pip install --upgrade dantalabs
+```
+
+That command installs both the Python modules (importable as `dantalabs.maestro`) and the `dlm` CLI. Use `dlm setup` to point the tools at your organisation and generate the local config file:
+
+```bash
+from dantalabs.maestro import MaestroClient
+
+client = MaestroClient(
+    organization_id="your-org-id",
+    token="your-api-token",
+    base_url="https://dantalabs.com"
+)
+print([agent.name for agent in client.list_agents()])
+```
+
+## Next Steps
+
+1. [Quick Start](/docs/quick-start) – Ship your first container agent and call it from the CLI.
+2. [Command Line](/docs/command-line) – Explore everything `dlm` can do, including deploying, querying, and debugging services.
+3. [Maestro Client](/docs/client) – Drive Maestro programmatically with rich Python objects and error handling.
+4. [Agent Architecture](/docs/agent-architecture) – Understand how runtime contracts, databases, and tokens fit together.
+5. [Service Definition Schema](/docs/agent-service-definition) – Document your agent's HTTP surface so future networks can connect services automatically.
+
+We update the documentation alongside each SDK release. If you catch a mismatch or want to suggest improvements, open an issue or reach out at dev@dantalabs.com.

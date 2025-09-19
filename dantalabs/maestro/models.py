@@ -77,6 +77,7 @@ class AgentDefinitionCreate(MaestroBaseModel):
     interface_id: Optional[UUID4] = None
     memory_template: Dict[str, Any] = Field(default_factory=dict)
     environment_variables: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    is_bundle: Optional[bool] = Field(default=False, description="Whether this agent uses a bundle instead of inline code")
 
 class AgentDefinition(MaestroBaseModel):
     id: UUID4
@@ -93,6 +94,7 @@ class AgentDefinition(MaestroBaseModel):
     organization_id: Optional[UUID4] = None # API response might still include it
     interface_id: Optional[UUID4] = None
     environment_variables: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    is_bundle: Optional[bool] = Field(default=False, description="Whether this agent uses a bundle instead of inline code")
 
 class AgentCreate(MaestroBaseModel):
     name: str
@@ -212,3 +214,30 @@ class ReturnFile(MaestroBaseModel):
     file_name: str
     file_type: str
     created_at: datetime
+
+# --- Database Models ---
+class CreateDatabaseRequest(MaestroBaseModel):
+    name: str = Field(min_length=1, max_length=50)
+    description: Optional[str] = Field(None, max_length=255)
+    database_type: Optional[str] = Field("default", description="Template type: default, analytics, ecommerce")
+    custom_tables: Optional[Dict[str, str]] = Field(None, description="Custom table definitions")
+
+class AgentDatabase(MaestroBaseModel):
+    id: UUID4
+    name: str
+    description: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+    agent_id: UUID4
+    organization_id: UUID4
+    connection_string: Optional[str] = Field(None, description="PostgreSQL proxy connection string")
+    database_template: Optional[str] = None
+
+class ExecuteSQLRequest(MaestroBaseModel):
+    sql: str
+
+class TableInfo(MaestroBaseModel):
+    name: str
+    full_name: str
+    type: str
+    comment: Optional[str]

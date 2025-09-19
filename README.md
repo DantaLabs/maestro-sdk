@@ -2,42 +2,83 @@
 
 A Python SDK for interacting with the DantaLabs Maestro API, featuring agent management, bundle deployment, and execution capabilities.
 
+## Documentation
+
+- The `/docs` directory contains the content that powers the public documentation site. Start with `docs/content/index.mdx` for an overview of features.
+- Command-line coverage lives in `docs/content/cli/commands.mdx`, which mirrors the behaviour of the `dlm` CLI shipped with this package.
+- The Python API is documented inline; see `dantalabs/maestro/client.py` for the full `MaestroClient` surface area, including resource helpers and bundle tooling.
+
 ## Installation
 
 ```bash
 pip install dantalabs
 ```
 
-## Quick Start
-
-### Configuration
-
-First, configure your credentials:
+or for the latest development version
 
 ```bash
-# Interactive setup
-dlm setup
+pip install git+https://github.com/DantaLabs/maestro-sdk.git
+```
+## Quick Start
 
-# Or set environment variables
+### Configure credentials
+
+```bash
+# Interactive setup (writes ~/.maestro/config.json)
+dlm setup
+dlm status
+
+# Prefer flags or environment variables in CI/CD
 export MAESTRO_API_URL="https://dantalabs.com"
 export MAESTRO_ORGANIZATION_ID="your-org-id"
 export MAESTRO_AUTH_TOKEN="your-token"
 ```
 
-### Basic Usage
+Most commands accept `--url`, `--org-id`, and `--token` flags when you need to override the stored configuration temporarily.
+
+### Instantiate the Python client
 
 ```python
 from dantalabs.maestro import MaestroClient
 
-# Initialize client
 client = MaestroClient(
     organization_id="your-org-id",
     base_url="https://dantalabs.com",
-    token="your-token"
+    token="your-token",
 )
 
-# List agents
 agents = client.list_agents()
+```
+
+### Deploy with the CLI
+
+```bash
+dlm deploy path/to/project \
+  --name "document-worker" \
+  --agent-type script \
+  --service
+```
+
+`dlm deploy` packages your project, uploads the bundle, and (optionally) rolls the definition out as a managed container service. Use `--definition-only` to skip service deployment, `--no-service` to keep the bundle only, and `--schema-file` to include JSON schema metadata.
+
+### Deploy programmatically
+
+```python
+agent_definition = client.create_and_upload_bundle(
+    source_dir="./my-agent",
+    name="My Agent",
+    description="Agent description",
+    include_requirements=True,
+)
+
+# Or split the steps
+bundle_path = client.create_bundle(
+    source_dir="./my-agent",
+    output_path="./my-agent.zip",
+    maestro_config={"entrypoint": "main.py", "version": "1.0.0"},
+)
+
+client.upload_agent_bundle(bundle_path=bundle_path, name="My Agent")
 ```
 
 ## Bundle Deployment
@@ -48,51 +89,39 @@ The SDK supports creating and deploying ZIP bundles containing your agent code a
 
 #### Using the CLI
 
-**Deploy a bundle from a directory (recommended):**
-```bash
-dlm deploy-bundle ./my-agent --name "My Agent" --desc "Agent description"
-```
+- `dlm deploy path/to/project` – end-to-end pipeline that packages, uploads, and optionally deploys your agent as a managed service.
+- `dlm create-bundle ./my-agent --output ./my-agent.zip` – create a ZIP archive locally without uploading.
+- `dlm upload-bundle ./my-agent.zip --name "My Agent" --create-agent` – turn an existing bundle into an agent definition.
+- `dlm update-bundle <definition-id> ./new-agent.zip` – replace the code for an existing definition.
+- `dlm deploy-bundle ./my-agent.zip --name "My Agent" --service` – upload and (optionally) redeploy in a single step.
+- `dlm download-definition-bundle <definition-id>` – fetch the currently deployed bundle for inspection.
 
-**Create a bundle locally:**
-```bash
-dlm create-bundle ./my-agent --output ./my-agent.zip
-```
-
-**Upload an existing bundle:**
-```bash
-dlm upload-bundle ./my-agent.zip --name "My Agent" --create-agent
-```
-
-**Update an existing bundle:**
-```bash
-dlm update-bundle DEFINITION_ID ./new-agent.zip
-```
+The CLI persists state (IDs, credentials, recent deployments) to `.maestro_state.json` in your project root so subsequent commands can reuse the same resources.
 
 #### Using the Python Client
 
 ```python
-# Create and upload bundle in one step
-agent_definition = client.create_and_upload_bundle(
-    source_dir="./my-agent",
-    name="My Agent",
-    description="Agent description",
-    include_requirements=True  # Auto-include requirements.txt or pyproject.toml
-)
-
-# Or create bundle locally first
-bundle_path = client.create_bundle(
+# Build a bundle with auto-detected requirements and optional maestro.yaml overrides
+bundle_path = client.bundle_creator.create_bundle(
     source_dir="./my-agent",
     output_path="./my-agent.zip",
-    maestro_config={
-        "entrypoint": "main.py",
-        "version": "1.0.0"
-    }
+    include_requirements=True,
+    install_dependencies=False,
+    maestro_config={"entrypoint": "main.py", "version": "1.0.0"},
 )
 
-# Then upload it
-agent_definition = client.upload_agent_bundle(
+# Upload or update definitions through the BundleManager helper
+definition = client.bundle_manager.upload_bundle(
     bundle_path=bundle_path,
-    name="My Agent"
+    name="My Agent",
+    description="Agent description",
+    shareable=True,
+)
+
+client.bundle_manager.update_bundle(
+    definition_id=definition.id,
+    bundle_path="./updated-agent.zip",
+    version="1.0.1",
 )
 ```
 
@@ -161,6 +190,16 @@ Create a JSON file with the same name as your directory:
 }
 ```
 
+## Python Client Overview
+
+`MaestroClient` centralises access to Maestro resources:
+
+- `client.organizations`, `client.agents`, `client.networks`, `client.executions`, `client.files`, and `client.utils` mirror the underlying REST resources with create/list/update helpers.
+- `client.bundle_creator` packages source directories, auto-detecting requirements files and optionally injecting a `maestro.yaml` manifest.
+- `client.bundle_manager` uploads, updates, and downloads bundles; it is what powers `create_and_upload_bundle` and other high-level helpers.
+- `client.proxy_http` is preconfigured for the proxy base URL so containerised agents can be called directly.
+- `client.get_managed_memory(name, agent_id, auto_save=True)` returns a persisted dict-like helper backed by the Maestro API.
+
 ## Agent Management
 
 ### Creating Agents
@@ -217,21 +256,62 @@ memory = client.get_managed_memory("session_data", agent_id=agent_id, auto_save=
 memory["data"] = "value"  # Automatically saved
 ```
 
-## CLI Commands
+## CLI Overview
 
-| Command | Description |
-|---------|-------------|
-| `dlm setup` | Configure credentials |
-| `dlm deploy` | Deploy single Python file as agent |
-| `dlm create-bundle` | Create ZIP bundle from directory |
-| `dlm upload-bundle` | Upload bundle to create agent definition |
-| `dlm deploy-bundle` | Create and upload bundle in one step |
-| `dlm update-bundle` | Update existing bundled agent definition |
-| `dlm download-definition-bundle` | Download bundle for agent definition |
-| `dlm create-agent` | Create agent from existing definition |
-| `dlm update-agent` | Update existing agent |
-| `dlm use-agent` | Set default agent for commands |
-| `dlm run-agent` | Execute agent with input |
+### Essentials
+
+| Command | Purpose |
+| --- | --- |
+| `dlm setup` | Configure the CLI interactively or script via flags |
+| `dlm status` | Verify API connectivity and stored credentials |
+| `dlm set-url` | Override the default Maestro API base URL |
+| `dlm version` | Print the SDK-packaged CLI version |
+
+### Deploying Code (Unified Pipeline)
+
+- `dlm deploy path/to/project --name "app" --service` packages, uploads, and deploys the project.
+- Add `--definition-only` to skip container rollout, `--no-service` to retain just the bundle, and `--force-definition` to create a fresh definition every time.
+- `--entrypoint`, `--version`, and `--schema-file` control metadata stored with the resulting definition and service.
+
+### Bundle Workflows
+
+- `dlm create-bundle ./my-agent --output ./my-agent.zip` packages source without uploading.
+- `dlm upload-bundle bundle.zip --name my-agent` creates a definition from an existing archive.
+- `dlm update-bundle <definition-id> bundle.zip` replaces the archive for an existing definition.
+- `dlm deploy-bundle bundle.zip --name my-agent --service` uploads and optionally redeploys a service in one step.
+- `dlm download-definition-bundle <definition-id>` retrieves the latest bundle for local inspection.
+
+### Agent Management
+
+| Command | What it does |
+| --- | --- |
+| `dlm list-agents` | List agents in the organisation (`--show-def` adds linked definitions) |
+| `dlm list-definitions` | Enumerate agent definitions and metadata |
+| `dlm create-agent` | Create an agent from a definition (interactive picker supported) |
+| `dlm update-agent <id>` | Rename, retarget, or update secrets for an agent |
+| `dlm use-agent [id]` | Persist a default agent in `.maestro_state.json` |
+| `dlm run-agent '{"foo": "bar"}'` | Execute a script agent synchronously |
+
+### Service Operations
+
+- `dlm service deploy <agent-id> [--env-file path]` redeploys a container service.
+- `dlm service deployment-status <agent-id>` reports Knative rollout state and endpoint URLs.
+- `dlm service logs <agent-id>` streams structured logs (`--level`, `--limit`, `--instance`).
+- `dlm service execute '{"input": 1}' --agent-id <id>` sends JSON payloads to the running service.
+- `dlm service proxy <agent-id> /path --method POST --data '{"foo": "bar"}'` debugs arbitrary HTTP routes.
+- `dlm service metrics` aggregates service health and utilisation data.
+- `dlm service stop <agent-id>` / `dlm service status <agent-id>` remain for backwards compatibility.
+
+### Built-In Databases
+
+- `dlm agentdb` lists every agent and its managed PostgreSQL databases.
+- `dlm agentdb list --agent <id>` narrows the output to a single agent.
+- `dlm agentdb inspect --db <database-id> --show-connection --show-tables` reveals connection strings and schema information.
+- `dlm agentdb connect --db <database-id>` opens a `psql`/`pgcli` session (use `--print-only` for credentials).
+
+### Templates & Starters
+
+`dlm init` clones official starter projects, while `dlm list-templates` shows what is currently available. Templates follow the `/health` on port 8080 contract and demonstrate how to consume the injected database credentials and Maestro API token.
 
 ## Advanced Features
 
@@ -307,4 +387,3 @@ except MaestroApiError as e:
 - typer
 - PyYAML (for bundle functionality)
 - tomli (for Python < 3.11)
-

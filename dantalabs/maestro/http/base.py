@@ -106,7 +106,7 @@ class HTTPClient:
                      if isinstance(d, list): return [stringify_uuids(i) for i in d]
                      if isinstance(d, UUID): return str(d)
                      return d
-                 content_to_send = stringify_uuids(current_json_data)
+                content_to_send = stringify_uuids(current_json_data)
             if not files and not form_data:
                  headers["Content-Type"] = "application/json"
         elif form_data:

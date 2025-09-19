@@ -1,8 +1,5 @@
-# Support importing from both old and new client implementations
-try:
-    from .client_new import MaestroClient
-except ImportError:
-    from .client import MaestroClient
+# Import the refactored client
+from .client import MaestroClient
 
 from .memory import ManagedMemory
 from .exceptions import (

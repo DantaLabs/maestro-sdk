@@ -1,12 +1,15 @@
-import typer
+import tempfile
+import zipfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional, Annotated
+from typing import Optional, Annotated, Iterator
 from uuid import UUID
-from datetime import datetime
-from ..config import save_project_state, PROJECT_STATE_FILE
+
+import typer
+
 from ..utils.client import get_client
-from ..utils.deployment import get_deploy_mode, deploy_single_file, deploy_bundle_with_state
-from ..utils.schemas import load_schemas, load_env_variables
+from ..utils.deployment import deploy_agent_unified
+from ..utils.schemas import load_schemas
 
 app = typer.Typer()
 
@@ -26,129 +29,106 @@ def deploy_command(
     agent_type: Annotated[str, typer.Option(
         "--agent-type", "-t",
         help="Type of the agent (e.g., 'script', 'chat', 'tool')."
-    )] = "script", 
-    force_mode: Annotated[Optional[str], typer.Option(
-        "--mode",
-        help="Force deployment mode: 'create', 'update', or 'redeploy'. Auto-detected if not specified."
+    )] = "script",
+    version: Annotated[str, typer.Option(
+        "--version",
+        help="Semantic version for the deployed bundle.",
+    )] = "1.0.0",
+    entrypoint: Annotated[Optional[str], typer.Option(
+        "--entrypoint",
+        help="Entrypoint Python file inside the bundle (defaults to backend auto-detection).",
     )] = None,
+    as_service: Annotated[bool, typer.Option(
+        "--service/--no-service",
+        help="Deploy as a long-running service once the agent is created."
+    )] = True,
     create_agent: Annotated[bool, typer.Option(
         "--create-agent/--definition-only",
         help="Create/update an Agent instance linked to the definition (default: True).",
     )] = True,
+    force_new_definition: Annotated[bool, typer.Option(
+        "--force-definition/--reuse-definition",
+        help="Force creation of a brand new agent definition instead of reusing by name."
+    )] = False,
+    safe: Annotated[bool, typer.Option(
+        "--safe/--overwrite",
+        help="Prevent overwriting an existing agent with the same name.",
+    )] = False,
     schema_file: Annotated[Optional[Path], typer.Option(
         "--schema-file", 
         help="Path to a JSON file containing input/output/memory schemas. Auto-detected if not specified."
-    )] = None,
-    env_file: Annotated[Optional[Path], typer.Option(
-        "--env-file", 
-        help="Path to a .env file containing environment variables. Auto-detected if not specified."
     )] = None,
     # Client options
     org_id: Annotated[Optional[UUID], typer.Option("--org-id", help="Maestro Organization ID (Overrides env var).")] = None,
     url: Annotated[Optional[str], typer.Option("--url", help="Maestro API Base URL (Overrides env var).")] = None,
     token: Annotated[Optional[str], typer.Option("--token", help="Maestro Auth Token (Overrides env var).")] = None,
 ):
-    """
-    Intelligently deploys agent code as a Maestro Agent Definition and Agent.
-    
-    Automatically detects whether to create, update, or redeploy based on existing state.
-    Supports both single Python files and directory-based agent bundles.
-    Automatically loads schemas and environment variables from conventional locations.
-    """
+    """Package the selected source, upload it, and let the unified deployment pipeline handle it."""
     client = get_client(org_id, url, token)
-    
-    # Handle file_path - if not provided, use current directory
+
     if file_path is None:
         file_path = Path.cwd()
-    
-    # Validate path exists
+
     if not file_path.exists():
         typer.secho(f"Error: Path '{file_path}' does not exist.", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
-    
-    # Determine if we're dealing with a file or directory
-    is_bundle = file_path.is_dir()
-    project_dir = file_path if is_bundle else file_path.parent
-    
-    # Determine agent name
-    if is_bundle:
-        agent_name = name or file_path.name
-        typer.echo(f"Deploying agent bundle from '{file_path}' as '{agent_name}'...")
-    else:
-        if not file_path.is_file() or not file_path.suffix == '.py':
-            typer.secho(f"Error: File path must be a Python file (.py) or a directory.", fg=typer.colors.RED, err=True)
-            raise typer.Exit(code=1)
-        agent_name = name or file_path.stem
-        typer.echo(f"Deploying agent from '{file_path.name}' as '{agent_name}'...")
-    
-    # Determine deployment mode
-    deploy_mode, existing_data = get_deploy_mode(client, agent_name, project_dir)
-    if force_mode:
-        if force_mode not in ["create", "update", "redeploy"]:
-            typer.secho(f"Error: Invalid mode '{force_mode}'. Must be 'create', 'update', or 'redeploy'.", fg=typer.colors.RED, err=True)
-            raise typer.Exit(code=1)
-        deploy_mode = force_mode
-        typer.echo(f"Using forced deployment mode: {deploy_mode}")
-    else:
-        typer.echo(f"Auto-detected deployment mode: {deploy_mode}")
 
-    # Handle bundle vs single file deployment
-    if is_bundle:
-        # Use bundle deployment for directories
-        return deploy_bundle_with_state(
+    project_dir = file_path if file_path.is_dir() else file_path.parent
+
+    if file_path.is_file() and file_path.suffix != ".py":
+        typer.secho("Error: When providing a file it must be a Python module (.py).", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    agent_name = name or (file_path.name if file_path.is_dir() else file_path.stem)
+
+    typer.echo(f"Packaging '{agent_name}' for deployment...")
+
+    # Load schemas so they can be attached to the deployment request
+    schema_base = file_path if file_path.is_dir() else file_path.parent
+    input_schema, output_schema, memory_template = load_schemas(schema_base, schema_file)
+
+    with _temporary_bundle(file_path) as bundle_path:
+        deploy_agent_unified(
             client=client,
-            source_dir=file_path,
+            bundle_path=bundle_path,
             agent_name=agent_name,
             description=description,
-            agent_type=agent_type,
-            deploy_mode=deploy_mode,
-            existing_data=existing_data,
+            version=version,
+            entrypoint=entrypoint,
             create_agent=create_agent,
-            schema_file=schema_file,
-            env_file=env_file,
+            auto_deploy_service=as_service,
+            agent_type=agent_type,
+            capabilities=None,
+            external_org_access=False,
+            input_schema=input_schema,
+            output_schema=output_schema,
+            memory_template=memory_template,
+            force_new_definition=force_new_definition,
+            safe_mode=safe,
             project_dir=project_dir
         )
-    
-    # Single file deployment
-    try:
-        agent_code = file_path.read_text()
-    except Exception as e:
-        typer.secho(f"Error reading file '{file_path}': {e}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-    
-    # Load schemas and environment variables
-    input_schema, output_schema, memory_template = load_schemas(file_path, schema_file)
-    env_variables = load_env_variables(file_path.parent, env_file)
 
-    # Deploy based on mode
-    definition_id, agent_id = deploy_single_file(
-        client=client,
-        agent_code=agent_code,
-        agent_name=agent_name,
-        description=description,
-        agent_type=agent_type,
-        deploy_mode=deploy_mode,
-        existing_data=existing_data,
-        create_agent=create_agent,
-        input_schema=input_schema,
-        output_schema=output_schema,
-        memory_template=memory_template,
-        env_variables=env_variables
-    )
-    
-    # Save state for future deployments
-    state_data = {
-        "agent_name": agent_name,
-        "agent_definition_id": str(definition_id) if definition_id else None,
-        "agent_id": str(agent_id) if agent_id else None,
-        "last_deploy_mode": deploy_mode,
-        "last_deployed_at": datetime.now().isoformat()
-    }
-    save_project_state(state_data, project_dir)
-    
-    typer.secho("Deployment completed successfully!", fg=typer.colors.GREEN)
-    if definition_id:
-        typer.echo(f"  Definition ID: {definition_id}")
-    if agent_id:
-        typer.echo(f"  Agent ID: {agent_id}")
-    typer.echo(f"  Project state saved to {project_dir / PROJECT_STATE_FILE}")
+
+@contextmanager
+def _temporary_bundle(source: Path) -> Iterator[Path]:
+    """Create a temporary ZIP archive for the provided source path."""
+    temp_file = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    temp_file.close()
+    archive_path = Path(temp_file.name)
+
+    try:
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            if source.is_dir():
+                for path in source.rglob("*"):
+                    if path.is_file():
+                        arcname = path.relative_to(source)
+                        zip_file.write(path, arcname)
+            else:
+                zip_file.write(source, source.name)
+
+        yield archive_path
+    finally:
+        try:
+            archive_path.unlink(missing_ok=True)
+        except Exception:
+            pass
