@@ -87,12 +87,12 @@ class MaestroClient:
     def _get_client(self) -> httpx.Client:
         """Initializes or returns the httpx client."""
         if self._client is None or self._client.is_closed:
-            self._client = httpx.Client(base_url=self.base_url, timeout=self._timeout)
+            self._client = httpx.Client(base_url=self.base_url, timeout=self._timeout, follow_redirects=True)
         return self._client
 
     def _get_client_with_timeout(self, timeout: float) -> httpx.Client:
         """Returns a httpx client with a custom timeout for specific operations."""
-        return httpx.Client(base_url=self.base_url, timeout=timeout)
+        return httpx.Client(base_url=self.base_url, timeout=timeout, follow_redirects=True)
 
     def _ensure_agent_id_set(self) -> UUID:
         """Checks if agent_id is set and returns it, otherwise raises ValueError."""
@@ -1683,7 +1683,7 @@ class MaestroClient:
         agent_id_to_use = agent_id or self._ensure_agent_id_set()
         
         result = self._request(
-            method="GET", path="/api/v1/agents/{agent_id}/bundle",
+            method="GET", path="/api/v1/agent-services/bundle/{agent_id}/",
             path_params={"agent_id": agent_id_to_use},
             expected_status=200, return_type="json"
         )
@@ -1718,23 +1718,37 @@ class MaestroClient:
         elif not os.path.exists(target_dir):
             os.makedirs(target_dir)
             
-        # Download the file directly from the API endpoint
-        bundle_path = os.path.join(target_dir, "agent_bundle.zip")
-        
-        response = self._request(
+        # Get presigned URL from the API endpoint
+        presigned_response = self._request(
             method="GET",
-            path="/api/v1/agents/bundle/{agent_id}/",
+            path="/api/v1/agent-services/bundle/{agent_id}/get-url",
             path_params={"agent_id": agent_id_to_use},
+            query_params={"agent_id": agent_id_to_use},
             expected_status=200,
-            return_type="bytes"
+            return_type="json"
         )
         
-        if not response:
-            raise MaestroError("Failed to download bundle")
+        if not presigned_response or "presigned_url" not in presigned_response:
+            raise MaestroError("Failed to get presigned URL for bundle download")
         
-        # Save the bundle
-        with open(bundle_path, 'wb') as f:
-            f.write(response)
+        presigned_url = presigned_response["presigned_url"]
+        
+        # Download the file directly from the presigned URL using requests
+        import requests
+        
+        bundle_path = os.path.join(target_dir, "agent_bundle.zip")
+        
+        try:
+            response = requests.get(presigned_url, stream=True)
+            response.raise_for_status()
+            
+            # Save the bundle
+            with open(bundle_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        except requests.RequestException as e:
+            raise MaestroError(f"Failed to download bundle from presigned URL: {str(e)}")
             
         return bundle_path
         

@@ -1,4 +1,9 @@
-from .client import MaestroClient
+# Support importing from both old and new client implementations
+try:
+    from .client_new import MaestroClient
+except ImportError:
+    from .client import MaestroClient
+
 from .memory import ManagedMemory
 from .exceptions import (
     MaestroError,
@@ -7,8 +12,8 @@ from .exceptions import (
     MaestroValidationError
 )
 
-# Optionally expose key models module
-# from . import models
+# Export models for external use
+from . import models
 
 # Define a version specific to the maestro component if needed,
 # although the main package version is usually sufficient.
@@ -16,11 +21,11 @@ __version__ = "0.1.0" # Matches top-level for now
 
 __all__ = [
     "MaestroClient",
-    "ManagedMemory",
+    "ManagedMemory", 
     "MaestroError",
     "MaestroApiError",
     "MaestroAuthError",
     "MaestroValidationError",
+    "models",
     "__version__",
-    # "models",
 ]

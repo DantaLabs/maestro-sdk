@@ -1,17 +1,7 @@
-import typer
-import os
-import sys
-import json 
-from pathlib import Path
-from typing import Optional, Annotated, Dict, Any, Tuple
-from uuid import UUID
-import dotenv
+from .cli.app import app
 
-from .maestro import MaestroClient
-from .maestro.models import AgentDefinitionCreate, AgentCreate, AgentUpdate, Agent, AgentDefinition
-from .maestro.exceptions import MaestroApiError, MaestroAuthError, MaestroValidationError
-from datetime import datetime
-import os
+if __name__ == "__main__":
+    app()
 
 # --- Configuration File Handling ---
 CONFIG_DIR = Path.home() / ".maestro"
