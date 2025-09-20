@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from uuid import UUID
 from ..models import CodeExecution
 from ..http.base import HTTPClient
@@ -18,9 +18,11 @@ class ExecutionResource:
             expected_status=200, organization_id=self.organization_id
         )
         
-    def list(self, limit: int = 10, skip: int = 0) -> List[CodeExecution]:
+    def list(self, limit: int = 10, skip: int = 0, agent_id: Optional[UUID] = None) -> List[CodeExecution]:
         """Lists code executions within the current organization."""
         query = {"limit": limit, "skip": skip}
+        if agent_id:
+            query["agent_id"] = str(agent_id)
         return self.http.request(
             method="GET", path="/api/v1/agents/executions", query_params=query,
             expected_status=200, response_model=List[CodeExecution], organization_id=self.organization_id
