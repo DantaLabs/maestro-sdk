@@ -18,15 +18,18 @@ from .models import *
 class MaestroClient:
     """
     Python SDK Client for the Maestro API using Bearer Token Authentication.
+    
+    Main client for interacting with the Maestro platform, providing access to
+    agents, networks, memory management, and other platform services.
 
-    Args:
+    Input:
         organization_id (Union[UUID, str]): The UUID of the organization context for API calls.
-        agent_id (Optional[Union[UUID, str]], optional): Default Agent ID for agent-specific calls. Defaults to None.
-        base_url (Optional[str], optional): The base URL of the Maestro API. Reads from MAESTRO_API_URL env var if None. Defaults to None.
-        proxy_base_url (Optional[str], optional): The base URL for agent proxy services. Reads from MAESTRO_PROXY_BASE_URL env var if None. Defaults to None.
-        token (Optional[str], optional): The Bearer token for authentication. Reads from MAESTRO_AUTH_TOKEN env var if None. Defaults to None.
-        timeout (float, optional): Request timeout in seconds. Defaults to 120.0.
-        raise_for_status (bool, optional): Whether to automatically raise MaestroApiError for non-2xx responses. Defaults to True.
+        agent_id (Optional[Union[UUID, str]]): Default Agent ID for agent-specific calls. Defaults to None.
+        base_url (Optional[str]): The base URL of the Maestro API. Reads from MAESTRO_API_URL env var if None.
+        proxy_base_url (Optional[str]): The base URL for agent proxy services. Reads from MAESTRO_PROXY_BASE_URL env var if None.
+        token (Optional[str]): The Bearer token for authentication. Reads from MAESTRO_AUTH_TOKEN env var if None.
+        timeout (float): Request timeout in seconds. Defaults to 120.0.
+        raise_for_status (bool): Whether to automatically raise MaestroApiError for non-2xx responses. Defaults to True.
 
     Raises:
         ValueError: If required parameters (organization_id, base_url, token) are missing or invalid.
@@ -44,7 +47,7 @@ class MaestroClient:
         token: Optional[str] = None,
         timeout: float = 120.0,
         raise_for_status: bool = True,
-    ):
+    ) -> None:
         try:
             self.organization_id: UUID = UUID(str(organization_id))
         except (ValueError, TypeError):
@@ -96,15 +99,27 @@ class MaestroClient:
         self.bundle_creator = BundleCreator()
         self.bundle_manager = BundleManager(self.http, self.organization_id)
 
-    def set_token(self, token: str):
-        """Sets or updates the authentication token."""
+    def set_token(self, token: str) -> None:
+        """
+        Sets or updates the authentication token.
+        
+        Input:
+            token (str): New authentication token to use for API requests.
+            
+        Raises:
+            ValueError: If token is empty or None.
+        """
         if not token:
             raise ValueError("Token cannot be empty.")
         self.http._token = token
         self.proxy_http._token = token
 
-    def clear_token(self):
-        """Clears the current authentication token."""
+    def clear_token(self) -> None:
+        """
+        Clears the current authentication token.
+        
+        Removes the authentication token from both main and proxy HTTP clients.
+        """
         self.http._token = ""
         self.proxy_http._token = ""
 
