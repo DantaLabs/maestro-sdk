@@ -7,15 +7,35 @@ from ..models import (
 from ..http.base import HTTPClient
 
 class AgentResource:
-    """Resource class for agent-related API operations."""
+    """
+    Resource class for agent-related API operations.
     
-    def __init__(self, http_client: HTTPClient, organization_id: UUID):
+    Handles all agent and agent definition operations including creation, 
+    execution, service management, and database operations.
+    """
+    
+    def __init__(self, http_client: HTTPClient, organization_id: UUID) -> None:
+        """
+        Initialize the AgentResource.
+        
+        Input:
+            http_client (HTTPClient): HTTP client for making API requests.
+            organization_id (UUID): Organization ID for scoping operations.
+        """
         self.http = http_client
         self.organization_id = organization_id
 
     # Agent Definition methods
     def create_definition(self, agent_definition_data: AgentDefinitionCreate) -> AgentDefinition:
-        """Creates an agent definition within the current organization."""
+        """
+        Creates an agent definition within the current organization.
+        
+        Input:
+            agent_definition_data (AgentDefinitionCreate): Agent definition data model.
+            
+        Output:
+            AgentDefinition: Created agent definition with ID and metadata.
+        """
         payload = {"agent_definition_data": agent_definition_data.model_dump(mode='json', exclude_unset=True, exclude_none=True)}
         return self.http.request(
             method="POST", path="/api/v1/agents/agent-definitions/", json_data=payload,
@@ -23,7 +43,15 @@ class AgentResource:
         )
         
     def list_definitions(self, name: Optional[str] = None) -> List[AgentDefinition]:
-        """Lists agent definitions within the current organization."""
+        """
+        Lists agent definitions within the current organization.
+        
+        Input:
+            name (Optional[str]): Filter by agent definition name. Defaults to None.
+            
+        Output:
+            List[AgentDefinition]: List of agent definitions matching the criteria.
+        """
         query = {}
         if name:
             query["name"] = name
@@ -34,7 +62,15 @@ class AgentResource:
         )
         
     def get_definition(self, definition_id: UUID) -> AgentDefinition:
-        """Gets a specific agent definition by ID within the current organization."""
+        """
+        Gets a specific agent definition by ID within the current organization.
+        
+        Input:
+            definition_id (UUID): Unique identifier of the agent definition.
+            
+        Output:
+            AgentDefinition: Agent definition with specified ID.
+        """
         return self.http.request(
             method="GET", path="/api/v1/agents/agent-definitions/{definition_id}",
             path_params={"definition_id": definition_id},
@@ -42,7 +78,16 @@ class AgentResource:
         )
         
     def update_definition(self, definition_id: UUID, definition_data: AgentDefinitionCreate) -> AgentDefinition:
-        """Updates an existing Agent Definition."""
+        """
+        Updates an existing Agent Definition.
+        
+        Input:
+            definition_id (UUID): Unique identifier of the agent definition to update.
+            definition_data (AgentDefinitionCreate): Updated agent definition data.
+            
+        Output:
+            AgentDefinition: Updated agent definition with new data.
+        """
         payload = {"update_data": definition_data.model_dump(mode='json')}
         return self.http.request(
             method="PUT",

@@ -75,7 +75,7 @@ class ManagedMemory(collections.abc.MutableMapping):
 
         print(f"Loading memory '{self._memory_name}' for agent {self._agent_id}...")
         try:
-            memory_details = self._client._get_memory_by_name_raw(self._memory_name)
+            memory_details = self._client._get_memory_by_name_raw(self._memory_name, self._agent_id)
 
             if memory_details and isinstance(memory_details, dict):
                 self._memory_id = UUID(str(memory_details['id']))
@@ -208,7 +208,7 @@ class ManagedMemory(collections.abc.MutableMapping):
                     "tags": self._memory_metadata.get("tags", [])
                 }
                 # Call the client's method to add memory
-                created_memory_response = self._client.add_memory_to_agent(memory_data_payload)
+                created_memory_response = self._client.add_memory_to_agent(memory_data_payload, self._agent_id)
 
                 if created_memory_response and isinstance(created_memory_response, dict) and created_memory_response.get("id"):
                     new_id = UUID(str(created_memory_response['id']))
